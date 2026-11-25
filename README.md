@@ -11,42 +11,133 @@ server (message broker) in Rust, built on tokio.
 - **Bounded memory**: per-subscription prefetch, per-connection write limits,
   producer throttling when a queue is full, and bounded topic buffers.
 
-## Use
+## Use & Deployment
 
-### Docker
+### Docker (GHCR)
 
 kyu deploys as a single container: the `kyu-server` binary on a
 [distroless](https://github.com/GoogleContainerTools/distroless) base image
 (no shell or package manager, runs as a non-root user), about 45 MB.
 
-Every push builds the image, checks that it starts and passes its health
-check, and publishes it to GitHub Container Registry
-(`.github/workflows/docker.yml`): tagged with the branch name,
-`sha-<commit>`, `latest` for the default branch, and the version for `v*`
-tags.
+Pre-built images are published to GitHub Container Registry on every push
+(`.github/workflows/docker.yml`) after passing the container health check:
+
+- `ghcr.io/reklis/kyu:0.1.2` / `ghcr.io/reklis/kyu:0.1` — release versions (recommended for production)
+- `ghcr.io/reklis/kyu:latest` — default branch
+- `ghcr.io/reklis/kyu:<branch>` / `ghcr.io/reklis/kyu:sha-<commit>` — branch and commit builds
 
 ```sh
-docker pull ghcr.io/reklis/kyu:latest
-docker build -t kyu .            # or build it yourself
-docker run -d --name kyu -p 61613:61613 kyu
-docker run -d --name kyu -p 61613:61613 -e KYU_LOGIN=app -e KYU_PASSCODE=secret kyu
+# Run the latest release from GHCR
+docker run -d --name kyu --restart unless-stopped \
+  -p 61613:61613 \
+  ghcr.io/reklis/kyu:0.1.2
+
+# With authentication and custom heart-beats (ms)
+docker run -d --name kyu --restart unless-stopped \
+  -p 61613:61613 \
+  -e KYU_LOGIN=app \
+  -e KYU_PASSCODE=secret \
+  -e KYU_HEARTBEAT=10000,10000 \
+  ghcr.io/reklis/kyu:0.1.2
+
+# Or build locally
+docker build -t kyu .
 ```
+
+#### Configuration
 
 | Variable | Default in the image | Meaning |
 |---|---|---|
 | `KYU_ADDR` | `0.0.0.0:61613` | Listen address |
-| `KYU_LOGIN`, `KYU_PASSCODE` | unset | Require these credentials on CONNECT |
+| `KYU_LOGIN`, `KYU_PASSCODE` | unset | Require these credentials on CONNECT (both must be set) |
 | `KYU_HEARTBEAT` | `10000,10000` | Server heart-beat settings `sx,sy` in ms (used when clients ask for heart-beats) |
 
+#### Docker Compose
+
+```yaml
+services:
+  kyu:
+    image: ghcr.io/reklis/kyu:0.1.2
+    restart: unless-stopped
+    ports:
+      - "61613:61613"
+    environment:
+      KYU_LOGIN: app
+      KYU_PASSCODE: secret
+      KYU_HEARTBEAT: "10000,10000"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+```
+
+#### Kubernetes
+
+kyu is a single-node, in-memory broker, so run a single replica (`replicas: 1`)
+and use `kyu-server --check` for probes:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kyu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kyu
+  template:
+    metadata:
+      labels:
+        app: kyu
+    spec:
+      containers:
+        - name: kyu
+          image: ghcr.io/reklis/kyu:0.1.2
+          ports:
+            - containerPort: 61613
+              name: stomp
+          env:
+            - name: KYU_HEARTBEAT
+              value: "10000,10000"
+          readinessProbe:
+            exec:
+              command: ["kyu-server", "--check"]
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["kyu-server", "--check"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kyu
+spec:
+  selector:
+    app: kyu
+  ports:
+    - name: stomp
+      port: 61613
+      targetPort: stomp
+```
+
+#### Operational notes
+
 - **Health check**: the image's `HEALTHCHECK` runs `kyu-server --check`, which
-  performs a real STOMP CONNECT (with the credentials above, if set), so
+  performs a real STOMP CONNECT (with `KYU_LOGIN`/`KYU_PASSCODE` if set), so
   "healthy" means the broker is answering, not just that the port is open.
-- **Stopping**: `docker stop` sends SIGTERM and kyu exits immediately with
-  status 0.
+- **Stopping**: `docker stop` / Kubernetes pod termination sends SIGTERM and
+  kyu exits immediately with status 0.
 - **State**: messages are held in memory and do not survive a restart, so
   there is nothing to mount as a volume.
+- **File descriptors**: raise `nofile` (e.g. `--ulimit nofile=65536:65536`)
+  when serving thousands of concurrent clients.
 - **Throughput**: Docker's port mapping costs some throughput (1×1 queue
-  about 200k/s through `-p` against 275k/s native); `--network host` avoids it.
+  about 200k/s through `-p` against 230k/s+ native); `--network host` avoids it.
+- **Architecture**: the published GHCR image is currently built for `linux/amd64`.
 
 ### Server binary
 
