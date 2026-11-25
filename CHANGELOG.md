@@ -4,6 +4,27 @@ All notable changes to kyu are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/); before 1.0, minor versions may
 change the public API.
 
+## 0.1.2 (2026-11-25)
+
+### Performance
+
+- **Codec**: cache parsed headers across partial reads, track the NULL scan
+  offset when `content-length` is absent, and reserve exact frame capacity once
+  `content-length` is known — eliminating repeated buffer reallocations and
+  header re-scans on large/chunked frames (1 MiB throughput 4.3× higher,
+  chunked 1 MiB decode 5.2× faster). Replaced `core::fmt` integer formatting
+  with a stack-buffered decimal writer.
+- **Server**: batch non-transactional `ACK`/`NACK` frames under a single shard
+  lock with deferred refill; add a direct-delivery fast path in `enqueue` and
+  eliminate redundant hash map lookups and `Arc` clones across queue dispatch
+  and topic fanout; switch shard hashing from `SipHash` to `foldhash` and store
+  subscription ids as `Str`.
+- **Client**: lock-free fast path in `Client::send_frame`, burst reading in
+  `IoTask`, `foldhash` for internal maps, and static/zero-copy headers.
+- **Transport**: skip read-timestamp `clock_gettime` calls when incoming
+  heart-beating is disabled, and reset the outgoing heart-beat timer immediately
+  on send to avoid a redundant poll cycle.
+
 ## 0.1.1 (2026-11-25)
 
 ### Added
