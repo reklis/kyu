@@ -45,7 +45,10 @@ fn decoded_headers_share_the_read_buffer() {
     for (k, v) in &frame.headers {
         for s in [k, v] {
             let p = s.as_bytes().as_ptr() as usize;
-            assert!(range.contains(&p), "{s:?} was copied out of the read buffer");
+            assert!(
+                range.contains(&p),
+                "{s:?} was copied out of the read buffer"
+            );
         }
     }
     assert_eq!(frame.command, Command::Send);

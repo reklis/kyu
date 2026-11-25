@@ -1,5 +1,5 @@
 //! Spec compliance tests for the STOMP 1.2 wire format.
-//! Section references are to https://stomp.github.io/stomp-specification-1.2.html
+//! Section references are to <https://stomp.github.io/stomp-specification-1.2.html>
 
 use bytes::{Bytes, BytesMut};
 use kyu::codec::{CodecError, Item, Limits, StompCodec};
@@ -16,7 +16,7 @@ fn decode_all_with(mut codec: StompCodec, input: &[u8]) -> Result<Vec<Item>, Cod
     while let Some(item) = codec.decode(&mut buf)? {
         out.push(item);
     }
-    assert!(buf.is_empty(), "undecoded bytes left over: {:?}", buf);
+    assert!(buf.is_empty(), "undecoded bytes left over: {buf:?}");
     Ok(out)
 }
 
@@ -73,7 +73,9 @@ fn frame_without_headers_or_body() {
 
 #[test]
 fn null_may_be_followed_by_multiple_eols() {
-    let fs = frames(decode_all(b"BEGIN\ntransaction:a\n\n\0\n\r\n\nBEGIN\ntransaction:b\n\n\0\n").unwrap());
+    let fs = frames(
+        decode_all(b"BEGIN\ntransaction:a\n\n\0\n\r\n\nBEGIN\ntransaction:b\n\n\0\n").unwrap(),
+    );
     assert_eq!(fs.len(), 2);
     assert_eq!(fs[1].header("transaction"), Some("b"));
 }
@@ -223,7 +225,10 @@ fn empty_header_value_is_allowed() {
 #[test]
 fn encodes_escape_sequences_in_names_and_values() {
     let frame = Frame::new(Command::Message).with_header("a:b\\c", "x\ry\nz:w\\");
-    assert_eq!(encode(frame).unwrap(), b"MESSAGE\na\\cb\\\\c:x\\ry\\nz\\cw\\\\\n\n\0");
+    assert_eq!(
+        encode(frame).unwrap(),
+        b"MESSAGE\na\\cb\\\\c:x\\ry\\nz\\cw\\\\\n\n\0"
+    );
 }
 
 #[test]
@@ -235,9 +240,15 @@ fn connect_headers_are_not_escaped_on_encode() {
 #[test]
 fn connect_header_with_newline_cannot_be_encoded() {
     let frame = Frame::new(Command::Connect).with_header("login", "a\nb");
-    assert!(matches!(encode(frame), Err(CodecError::UnencodableHeader(_))));
+    assert!(matches!(
+        encode(frame),
+        Err(CodecError::UnencodableHeader(_))
+    ));
     let frame = Frame::new(Command::Connected).with_header("a:b", "c");
-    assert!(matches!(encode(frame), Err(CodecError::UnencodableHeader(_))));
+    assert!(matches!(
+        encode(frame),
+        Err(CodecError::UnencodableHeader(_))
+    ));
 }
 
 #[test]
@@ -297,7 +308,10 @@ fn encoder_adds_content_length_for_bodies() {
         .with_header("destination", "/queue/a")
         .with_body("a\0b");
     let bytes = encode(frame).unwrap();
-    assert_eq!(bytes, b"SEND\ndestination:/queue/a\ncontent-length:3\n\na\0b\0");
+    assert_eq!(
+        bytes,
+        b"SEND\ndestination:/queue/a\ncontent-length:3\n\na\0b\0"
+    );
     assert_eq!(&decode_one(&bytes).body[..], b"a\0b");
 }
 
@@ -353,7 +367,10 @@ fn first_repeated_header_wins_and_history_is_kept() {
     assert_eq!(f.header("foo"), Some("World"));
     assert_eq!(
         f.headers,
-        vec![("foo".into(), "World".into()), ("foo".into(), "Hello".into())] as Vec<(Str, Str)>
+        vec![
+            ("foo".into(), "World".into()),
+            ("foo".into(), "Hello".into())
+        ] as Vec<(Str, Str)>
     );
 }
 
@@ -370,7 +387,10 @@ fn first_content_length_wins() {
 #[test]
 fn lone_eols_are_heartbeats() {
     let items = decode_all(b"\n\r\n\n").unwrap();
-    assert_eq!(items, vec![Item::Heartbeat, Item::Heartbeat, Item::Heartbeat]);
+    assert_eq!(
+        items,
+        vec![Item::Heartbeat, Item::Heartbeat, Item::Heartbeat]
+    );
 }
 
 #[test]
@@ -408,17 +428,26 @@ fn limited(limits: Limits) -> StompCodec {
 
 #[test]
 fn rejects_frames_over_max_size() {
-    let codec = limited(Limits { max_frame_size: 32, ..Limits::default() });
+    let codec = limited(Limits {
+        max_frame_size: 32,
+        ..Limits::default()
+    });
     let body = vec![b'x'; 64];
     let mut input = b"SEND\n\n".to_vec();
     input.extend_from_slice(&body);
     // no NUL yet: the decoder must not buffer forever
-    assert!(matches!(decode_all_with(codec, &input), Err(CodecError::FrameTooLarge)));
+    assert!(matches!(
+        decode_all_with(codec, &input),
+        Err(CodecError::FrameTooLarge)
+    ));
 }
 
 #[test]
 fn rejects_content_length_over_max_size() {
-    let codec = limited(Limits { max_frame_size: 32, ..Limits::default() });
+    let codec = limited(Limits {
+        max_frame_size: 32,
+        ..Limits::default()
+    });
     assert!(matches!(
         decode_all_with(codec, b"SEND\ncontent-length:1000\n\n"),
         Err(CodecError::FrameTooLarge)
@@ -427,7 +456,10 @@ fn rejects_content_length_over_max_size() {
 
 #[test]
 fn rejects_too_many_headers() {
-    let codec = limited(Limits { max_headers: 2, ..Limits::default() });
+    let codec = limited(Limits {
+        max_headers: 2,
+        ..Limits::default()
+    });
     assert!(matches!(
         decode_all_with(codec, b"SEND\na:1\nb:2\nc:3\n\n\0"),
         Err(CodecError::TooManyHeaders)
@@ -436,7 +468,10 @@ fn rejects_too_many_headers() {
 
 #[test]
 fn rejects_header_lines_that_are_too_long() {
-    let codec = limited(Limits { max_header_length: 8, ..Limits::default() });
+    let codec = limited(Limits {
+        max_header_length: 8,
+        ..Limits::default()
+    });
     assert!(matches!(
         decode_all_with(codec, b"SEND\nabc:0123456789\n\n\0"),
         Err(CodecError::HeaderTooLong)
@@ -447,5 +482,8 @@ fn rejects_header_lines_that_are_too_long() {
 fn frame_body_bytes_type() {
     // Bodies are arbitrary octets
     let f = Frame::new(Command::Send).with_body(Bytes::from_static(&[0xff, 0x00, 0x01]));
-    assert_eq!(&decode_one(&encode(f).unwrap()).body[..], &[0xff, 0x00, 0x01]);
+    assert_eq!(
+        &decode_one(&encode(f).unwrap()).body[..],
+        &[0xff, 0x00, 0x01]
+    );
 }

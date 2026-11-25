@@ -11,6 +11,11 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep, sleep};
 
+/// Nanoseconds since `base`, saturating (u64 nanoseconds last 584 years).
+fn nanos_since(base: Instant) -> u64 {
+    u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// When bytes were last read from a connection; lock-free.
 #[derive(Clone)]
 pub struct LastRead {
@@ -20,11 +25,14 @@ pub struct LastRead {
 
 impl LastRead {
     fn new() -> LastRead {
-        LastRead { base: Instant::now(), nanos: Arc::new(AtomicU64::new(0)) }
+        LastRead {
+            base: Instant::now(),
+            nanos: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     fn touch(&self) {
-        self.nanos.store(self.base.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.nanos.store(nanos_since(self.base), Ordering::Relaxed);
     }
 
     pub fn get(&self) -> Instant {
@@ -40,7 +48,11 @@ pub struct Activity<S> {
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Activity<S> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let before = buf.filled().len();
         let res = Pin::new(&mut this.inner).poll_read(cx, buf);
@@ -52,7 +64,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for Activity<S> {
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for Activity<S> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -82,7 +98,7 @@ pub fn negotiate(can_send: u32, wants: u32) -> Option<Duration> {
     if can_send == 0 || wants == 0 {
         None
     } else {
-        Some(Duration::from_millis(can_send.max(wants) as u64))
+        Some(Duration::from_millis(u64::from(can_send.max(wants))))
     }
 }
 
@@ -93,7 +109,10 @@ pub fn read_deadline(interval: Duration) -> Duration {
 
 impl<S> Activity<S> {
     pub fn new(inner: S) -> Activity<S> {
-        Activity { inner, last: LastRead::new() }
+        Activity {
+            inner,
+            last: LastRead::new(),
+        }
     }
 }
 
@@ -117,14 +136,14 @@ pub struct Heartbeats {
 
 impl Heartbeats {
     pub fn new(out: Option<Duration>, inn: Option<Duration>, last_read: LastRead) -> Heartbeats {
-        let far = Duration::from_secs(86400 * 365);
+        let far = Duration::from_hours(24 * 365); // effectively never
         Heartbeats {
             out,
             inn,
             last_write: Instant::now(),
             last_read,
             write_timer: Box::pin(sleep(out.unwrap_or(far))),
-            read_timer: Box::pin(sleep(inn.map(read_deadline).unwrap_or(far))),
+            read_timer: Box::pin(sleep(inn.map_or(far, read_deadline))),
         }
     }
 

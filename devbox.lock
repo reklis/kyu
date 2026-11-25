@@ -153,6 +153,54 @@
           "store_path": "/nix/store/csck7hvqavqkc2pi5sigj1wqpfzs2hj3-rabbitmq-server-4.3.1"
         }
       }
+    },
+    "rust-code-analysis@latest": {
+      "last_modified": "2026-10-02T22:55:44Z",
+      "resolved": "github:NixOS/nixpkgs/55ba7f49ef2962b42cbd126522b7df5f95037679#rust-code-analysis",
+      "source": "devbox-search",
+      "version": "0.0.25",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/a35hzrs7xc1siasj382xd1rxs7h8yzia-rust-code-analysis-0.0.25",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/a35hzrs7xc1siasj382xd1rxs7h8yzia-rust-code-analysis-0.0.25"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/2p4d372y2aw58dpj18w31pprqgcpx7vi-rust-code-analysis-0.0.25",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/2p4d372y2aw58dpj18w31pprqgcpx7vi-rust-code-analysis-0.0.25"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/ggwicqjq86ahccsa23fc1xrv6inlmcx7-rust-code-analysis-0.0.25",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/ggwicqjq86ahccsa23fc1xrv6inlmcx7-rust-code-analysis-0.0.25"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/fg4cri949j4nryx3a0ablvc42sl2dily-rust-code-analysis-0.0.25",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/fg4cri949j4nryx3a0ablvc42sl2dily-rust-code-analysis-0.0.25"
+        }
+      }
     }
   }
 }

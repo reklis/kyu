@@ -91,7 +91,8 @@ async fn no_common_version_is_an_error_listing_supported_versions() {
 async fn missing_accept_version_means_1_0_only() {
     let addr = start_default_server().await;
     let mut c = Conn::open(addr).await;
-    c.send(Frame::new(Command::Connect).with_header("host", "localhost")).await;
+    c.send(Frame::new(Command::Connect).with_header("host", "localhost"))
+        .await;
     let f = c.expect_error_and_close().await;
     assert_eq!(f.header("version"), Some("1.2"));
 }
@@ -100,7 +101,8 @@ async fn missing_accept_version_means_1_0_only() {
 async fn missing_host_is_rejected() {
     let addr = start_default_server().await;
     let mut c = Conn::open(addr).await;
-    c.send(Frame::new(Command::Connect).with_header("accept-version", "1.2")).await;
+    c.send(Frame::new(Command::Connect).with_header("accept-version", "1.2"))
+        .await;
     let f = c.expect_error_and_close().await;
     assert!(f.header("message").is_some());
 }
@@ -117,7 +119,8 @@ async fn first_frame_must_be_connect() {
 async fn connect_with_body_is_rejected() {
     let addr = start_default_server().await;
     let mut c = Conn::open(addr).await;
-    c.send_raw(b"CONNECT\naccept-version:1.2\nhost:localhost\n\nbody\0").await;
+    c.send_raw(b"CONNECT\naccept-version:1.2\nhost:localhost\n\nbody\0")
+        .await;
     c.expect_error_and_close().await;
 }
 
@@ -134,11 +137,21 @@ async fn authentication_rejects_bad_credentials() {
     c.expect_error_and_close().await;
 
     let mut c = Conn::open(addr).await;
-    c.send(connect_frame().with_header("login", "guest").with_header("passcode", "nope")).await;
+    c.send(
+        connect_frame()
+            .with_header("login", "guest")
+            .with_header("passcode", "nope"),
+    )
+    .await;
     c.expect_error_and_close().await;
 
     let mut c = Conn::open(addr).await;
-    c.send(connect_frame().with_header("login", "guest").with_header("passcode", "s3cret")).await;
+    c.send(
+        connect_frame()
+            .with_header("login", "guest")
+            .with_header("passcode", "s3cret"),
+    )
+    .await;
     c.expect_command(Command::Connected).await;
 }
 
@@ -151,7 +164,8 @@ async fn connect_headers_are_not_unescaped() {
     })
     .await;
     let mut c = Conn::open(addr).await;
-    c.send_raw(b"CONNECT\naccept-version:1.2\nhost:h\nlogin:a\\cb\npasscode:p:w\n\n\0").await;
+    c.send_raw(b"CONNECT\naccept-version:1.2\nhost:h\nlogin:a\\cb\npasscode:p:w\n\n\0")
+        .await;
     c.expect_command(Command::Connected).await;
 }
 
@@ -160,7 +174,10 @@ async fn connect_headers_are_not_unescaped() {
 // ---------------------------------------------------------------------------
 
 fn hb_server(sx: u32, sy: u32) -> ServerConfig {
-    ServerConfig { heartbeat: (sx, sy), ..ServerConfig::default() }
+    ServerConfig {
+        heartbeat: (sx, sy),
+        ..ServerConfig::default()
+    }
 }
 
 #[tokio::test]
@@ -177,7 +194,8 @@ async fn server_sends_heartbeats_at_negotiated_rate() {
     let addr = start_server(hb_server(50, 0)).await;
     let mut c = Conn::open(addr).await;
     // client cannot send, wants one every 100ms => MAX(50, 100) = 100ms
-    c.send(connect_frame().with_header("heart-beat", "0,100")).await;
+    c.send(connect_frame().with_header("heart-beat", "0,100"))
+        .await;
     c.expect_command(Command::Connected).await;
 
     let start = tokio::time::Instant::now();
@@ -188,7 +206,10 @@ async fn server_sends_heartbeats_at_negotiated_rate() {
             other => panic!("expected heart-beat, got {other:?}"),
         }
     }
-    assert!((3..=7).contains(&beats), "got {beats} heart-beats in ~550ms");
+    assert!(
+        (3..=7).contains(&beats),
+        "got {beats} heart-beats in ~550ms"
+    );
 }
 
 #[tokio::test]
@@ -202,7 +223,8 @@ async fn no_heartbeat_header_means_no_heartbeats() {
 async fn zero_client_desire_means_no_heartbeats() {
     let addr = start_server(hb_server(20, 0)).await;
     let mut c = Conn::open(addr).await;
-    c.send(connect_frame().with_header("heart-beat", "0,0")).await;
+    c.send(connect_frame().with_header("heart-beat", "0,0"))
+        .await;
     c.expect_command(Command::Connected).await;
     assert_eq!(c.next_item(Duration::from_millis(200)).await, None);
 }
@@ -212,7 +234,8 @@ async fn server_drops_client_that_stops_heartbeating() {
     let addr = start_server(hb_server(0, 50)).await;
     let mut c = Conn::open(addr).await;
     // client promises a heart-beat every 50ms, then goes silent
-    c.send(connect_frame().with_header("heart-beat", "50,0")).await;
+    c.send(connect_frame().with_header("heart-beat", "50,0"))
+        .await;
     c.expect_command(Command::Connected).await;
     let closed = tokio::time::timeout(Duration::from_secs(1), c.wait_closed()).await;
     assert!(closed.is_ok(), "server kept a silent connection open");
@@ -222,24 +245,28 @@ async fn server_drops_client_that_stops_heartbeating() {
 async fn client_heartbeats_keep_connection_alive() {
     let addr = start_server(hb_server(0, 50)).await;
     let mut c = Conn::open(addr).await;
-    c.send(connect_frame().with_header("heart-beat", "50,0")).await;
+    c.send(connect_frame().with_header("heart-beat", "50,0"))
+        .await;
     c.expect_command(Command::Connected).await;
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_millis(40)).await;
         c.send_heartbeat().await;
     }
-    c.send_with_receipt(send_frame("/queue/hb", "still here"), "r1").await;
+    c.send_with_receipt(send_frame("/queue/hb", "still here"), "r1")
+        .await;
 }
 
 #[tokio::test]
 async fn any_frame_counts_as_heartbeat_activity() {
     let addr = start_server(hb_server(0, 50)).await;
     let mut c = Conn::open(addr).await;
-    c.send(connect_frame().with_header("heart-beat", "50,0")).await;
+    c.send(connect_frame().with_header("heart-beat", "50,0"))
+        .await;
     c.expect_command(Command::Connected).await;
     for i in 0..8 {
         tokio::time::sleep(Duration::from_millis(40)).await;
-        c.send_with_receipt(send_frame("/queue/hb2", "x"), &format!("r{i}")).await;
+        c.send_with_receipt(send_frame("/queue/hb2", "x"), &format!("r{i}"))
+            .await;
     }
 }
 
@@ -247,7 +274,8 @@ async fn any_frame_counts_as_heartbeat_activity() {
 async fn invalid_heartbeat_header_is_rejected() {
     let addr = start_default_server().await;
     let mut c = Conn::open(addr).await;
-    c.send(connect_frame().with_header("heart-beat", "fast")).await;
+    c.send(connect_frame().with_header("heart-beat", "fast"))
+        .await;
     c.expect_error_and_close().await;
 }
 
@@ -274,8 +302,16 @@ async fn message_is_delivered_with_required_headers() {
     assert!(m.header("message-id").is_some());
     assert_eq!(m.header("content-type"), Some("text/plain"));
     assert_eq!(m.header("content-length"), Some("13"));
-    assert_eq!(m.header("x-custom"), Some("v:1"), "user headers must pass through");
-    assert_eq!(m.header("ack"), None, "auto subscriptions carry no ack header");
+    assert_eq!(
+        m.header("x-custom"),
+        Some("v:1"),
+        "user headers must pass through"
+    );
+    assert_eq!(
+        m.header("ack"),
+        None,
+        "auto subscriptions carry no ack header"
+    );
     assert_eq!(m.header("receipt"), None);
     assert_eq!(body(&m), "hello queue a");
 }
@@ -316,9 +352,11 @@ async fn binary_body_with_nulls_is_delivered_intact() {
 async fn crlf_frames_are_accepted() {
     let addr = start_default_server().await;
     let mut c = Conn::open(addr).await;
-    c.send_raw(b"CONNECT\r\naccept-version:1.2\r\nhost:localhost\r\n\r\n\0").await;
+    c.send_raw(b"CONNECT\r\naccept-version:1.2\r\nhost:localhost\r\n\r\n\0")
+        .await;
     c.expect_command(Command::Connected).await;
-    c.send_raw(b"SEND\r\ndestination:/queue/crlf\r\nreceipt:1\r\n\r\nhi\0\r\n").await;
+    c.send_raw(b"SEND\r\ndestination:/queue/crlf\r\nreceipt:1\r\n\r\nhi\0\r\n")
+        .await;
     c.expect_command(Command::Receipt).await;
 }
 
@@ -327,7 +365,8 @@ async fn escaped_headers_survive_the_round_trip() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
     c.subscribe("a:b", "/queue/esc:ape\n", "auto").await;
-    c.send(send_frame("/queue/esc:ape\n", "x").with_header("we\\ird", "li\rne")).await;
+    c.send(send_frame("/queue/esc:ape\n", "x").with_header("we\\ird", "li\rne"))
+        .await;
     let m = c.expect_command(Command::Message).await;
     assert_eq!(m.header("subscription"), Some("a:b"));
     assert_eq!(m.header("destination"), Some("/queue/esc:ape\n"));
@@ -340,7 +379,8 @@ async fn repeated_destination_uses_first_value() {
     let mut c = Conn::connect(addr).await;
     c.subscribe("1", "/queue/first", "auto").await;
     c.subscribe("2", "/queue/second", "auto").await;
-    c.send_raw(b"SEND\ndestination:/queue/first\ndestination:/queue/second\n\nx\0").await;
+    c.send_raw(b"SEND\ndestination:/queue/first\ndestination:/queue/second\n\nx\0")
+        .await;
     let m = c.expect_command(Command::Message).await;
     assert_eq!(m.header("subscription"), Some("1"));
     c.expect_nothing().await;
@@ -350,7 +390,12 @@ async fn repeated_destination_uses_first_value() {
 async fn send_without_destination_is_an_error() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
-    c.send(Frame::new(Command::Send).with_header("receipt", "r9").with_body("x")).await;
+    c.send(
+        Frame::new(Command::Send)
+            .with_header("receipt", "r9")
+            .with_body("x"),
+    )
+    .await;
     let e = c.expect_error_and_close().await;
     assert_eq!(e.header("receipt-id"), Some("r9"));
     assert!(e.header("message").is_some());
@@ -360,7 +405,8 @@ async fn send_without_destination_is_an_error() {
 async fn subscribe_requires_destination() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
-    c.send(Frame::new(Command::Subscribe).with_header("id", "0")).await;
+    c.send(Frame::new(Command::Subscribe).with_header("id", "0"))
+        .await;
     c.expect_error_and_close().await;
 }
 
@@ -368,7 +414,8 @@ async fn subscribe_requires_destination() {
 async fn subscribe_requires_id() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
-    c.send(Frame::new(Command::Subscribe).with_header("destination", "/queue/a")).await;
+    c.send(Frame::new(Command::Subscribe).with_header("destination", "/queue/a"))
+        .await;
     c.expect_error_and_close().await;
 }
 
@@ -394,8 +441,18 @@ async fn same_subscription_id_on_different_connections_is_fine() {
     a.subscribe("0", "/topic/same", "auto").await;
     b.subscribe("0", "/topic/same", "auto").await;
     a.publish("/topic/same", "x").await;
-    assert_eq!(a.expect_command(Command::Message).await.header("subscription"), Some("0"));
-    assert_eq!(b.expect_command(Command::Message).await.header("subscription"), Some("0"));
+    assert_eq!(
+        a.expect_command(Command::Message)
+            .await
+            .header("subscription"),
+        Some("0")
+    );
+    assert_eq!(
+        b.expect_command(Command::Message)
+            .await
+            .header("subscription"),
+        Some("0")
+    );
 }
 
 #[tokio::test]
@@ -417,7 +474,9 @@ async fn ack_defaults_to_auto() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
     c.send_with_receipt(
-        Frame::new(Command::Subscribe).with_header("id", "0").with_header("destination", "/queue/d"),
+        Frame::new(Command::Subscribe)
+            .with_header("id", "0")
+            .with_header("destination", "/queue/d"),
         "s",
     )
     .await;
@@ -506,7 +565,8 @@ async fn unsubscribe_stops_delivery() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
     c.subscribe("0", "/topic/u", "auto").await;
-    c.send_with_receipt(Frame::new(Command::Unsubscribe).with_header("id", "0"), "u").await;
+    c.send_with_receipt(Frame::new(Command::Unsubscribe).with_header("id", "0"), "u")
+        .await;
     c.publish("/topic/u", "x").await;
     c.expect_nothing().await;
 }
@@ -523,7 +583,8 @@ async fn unsubscribe_requires_id() {
 async fn unsubscribe_unknown_id_is_an_error() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
-    c.send(Frame::new(Command::Unsubscribe).with_header("id", "nope")).await;
+    c.send(Frame::new(Command::Unsubscribe).with_header("id", "nope"))
+        .await;
     c.expect_error_and_close().await;
 }
 
@@ -532,7 +593,8 @@ async fn subscription_id_can_be_reused_after_unsubscribe() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
     c.subscribe("0", "/topic/r1", "auto").await;
-    c.send_with_receipt(Frame::new(Command::Unsubscribe).with_header("id", "0"), "u").await;
+    c.send_with_receipt(Frame::new(Command::Unsubscribe).with_header("id", "0"), "u")
+        .await;
     c.subscribe("0", "/topic/r2", "auto").await;
     c.publish("/topic/r2", "x").await;
     c.expect_command(Command::Message).await;
@@ -656,7 +718,10 @@ async fn client_individual_nack_is_not_cumulative() {
     let ms = receive_bodies(&mut c, 3).await;
     c.send(nack(&ms[1])).await;
     c.disconnect().await;
-    assert_eq!(remaining_bodies(addr, "/queue/nind").await, vec!["m1", "m3"]);
+    assert_eq!(
+        remaining_bodies(addr, "/queue/nind").await,
+        vec!["m1", "m3"]
+    );
 }
 
 #[tokio::test]
@@ -679,7 +744,8 @@ async fn nack_requires_id() {
 async fn ack_with_unknown_id_is_an_error() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
-    c.send(Frame::new(Command::Ack).with_header("id", "bogus")).await;
+    c.send(Frame::new(Command::Ack).with_header("id", "bogus"))
+        .await;
     c.expect_error_and_close().await;
 }
 
@@ -690,7 +756,8 @@ async fn unsubscribe_requeues_unacked_queue_messages() {
     c.subscribe("0", "/queue/unsub", "client").await;
     c.publish("/queue/unsub", "m1").await;
     receive_bodies(&mut c, 1).await;
-    c.send_with_receipt(Frame::new(Command::Unsubscribe).with_header("id", "0"), "u").await;
+    c.send_with_receipt(Frame::new(Command::Unsubscribe).with_header("id", "0"), "u")
+        .await;
     assert_eq!(remaining_bodies(addr, "/queue/unsub").await, vec!["m1"]);
 }
 
@@ -716,8 +783,16 @@ async fn transactional_sends_are_delivered_on_commit() {
 
     let mut c = Conn::connect(addr).await;
     c.send(begin("tx1")).await;
-    c.send_with_receipt(send_frame("/queue/tx", "a").with_header("transaction", "tx1"), "s1").await;
-    c.send_with_receipt(send_frame("/queue/tx", "b").with_header("transaction", "tx1"), "s2").await;
+    c.send_with_receipt(
+        send_frame("/queue/tx", "a").with_header("transaction", "tx1"),
+        "s1",
+    )
+    .await;
+    c.send_with_receipt(
+        send_frame("/queue/tx", "b").with_header("transaction", "tx1"),
+        "s2",
+    )
+    .await;
     sub.expect_nothing().await;
 
     c.send_with_receipt(commit("tx1"), "c").await;
@@ -734,7 +809,8 @@ async fn aborted_sends_are_discarded() {
     sub.subscribe("0", "/queue/txa", "auto").await;
     let mut c = Conn::connect(addr).await;
     c.send(begin("tx1")).await;
-    c.send(send_frame("/queue/txa", "a").with_header("transaction", "tx1")).await;
+    c.send(send_frame("/queue/txa", "a").with_header("transaction", "tx1"))
+        .await;
     c.send_with_receipt(abort("tx1"), "a").await;
     sub.expect_nothing().await;
 }
@@ -824,7 +900,8 @@ async fn abort_of_unknown_transaction_is_an_error() {
 async fn send_in_unknown_transaction_is_an_error() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
-    c.send(send_frame("/queue/a", "x").with_header("transaction", "nope")).await;
+    c.send(send_frame("/queue/a", "x").with_header("transaction", "nope"))
+        .await;
     c.expect_error_and_close().await;
 }
 
@@ -845,7 +922,8 @@ async fn disconnect_aborts_open_transactions() {
     sub.subscribe("0", "/queue/txd", "auto").await;
     let mut c = Conn::connect(addr).await;
     c.send(begin("t")).await;
-    c.send(send_frame("/queue/txd", "x").with_header("transaction", "t")).await;
+    c.send(send_frame("/queue/txd", "x").with_header("transaction", "t"))
+        .await;
     c.disconnect().await;
     sub.expect_nothing().await;
 }
@@ -857,7 +935,11 @@ async fn connection_failure_aborts_open_transactions() {
     sub.subscribe("0", "/queue/txf", "auto").await;
     let mut c = Conn::connect(addr).await;
     c.send(begin("t")).await;
-    c.send_with_receipt(send_frame("/queue/txf", "x").with_header("transaction", "t"), "r").await;
+    c.send_with_receipt(
+        send_frame("/queue/txf", "x").with_header("transaction", "t"),
+        "r",
+    )
+    .await;
     drop(c);
     sub.expect_nothing().await;
 }
@@ -872,7 +954,10 @@ async fn every_client_frame_can_request_a_receipt() {
     let mut c = Conn::connect(addr).await;
     c.send_with_receipt(send_frame("/queue/rc", "x"), "1").await;
     c.send_with_receipt(
-        Frame::new(Command::Subscribe).with_header("id", "s").with_header("destination", "/queue/rc").with_header("ack", "client"),
+        Frame::new(Command::Subscribe)
+            .with_header("id", "s")
+            .with_header("destination", "/queue/rc")
+            .with_header("ack", "client"),
         "2",
     )
     .await;
@@ -885,14 +970,16 @@ async fn every_client_frame_can_request_a_receipt() {
     c.publish("/queue/rc", "y").await;
     let m = c.expect_command(Command::Message).await;
     c.send_with_receipt(nack(&m), "8").await;
-    c.send_with_receipt(Frame::new(Command::Unsubscribe).with_header("id", "s"), "9").await;
+    c.send_with_receipt(Frame::new(Command::Unsubscribe).with_header("id", "s"), "9")
+        .await;
 }
 
 #[tokio::test]
 async fn receipt_ids_are_escaped_correctly() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
-    c.send_with_receipt(send_frame("/queue/a", "x"), "message:12345\n").await;
+    c.send_with_receipt(send_frame("/queue/a", "x"), "message:12345\n")
+        .await;
 }
 
 #[tokio::test]
@@ -931,7 +1018,8 @@ async fn frames_before_disconnect_are_processed() {
 async fn unknown_command_is_an_error() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
-    c.send(Frame::new(Command::Other("FROB".into())).with_header("receipt", "f")).await;
+    c.send(Frame::new(Command::Other("FROB".into())).with_header("receipt", "f"))
+        .await;
     let e = c.expect_error_and_close().await;
     assert_eq!(e.header("receipt-id"), Some("f"));
 }
@@ -940,7 +1028,8 @@ async fn unknown_command_is_an_error() {
 async fn server_frames_from_client_are_errors() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
-    c.send(Frame::new(Command::Receipt).with_header("receipt-id", "x")).await;
+    c.send(Frame::new(Command::Receipt).with_header("receipt-id", "x"))
+        .await;
     c.expect_error_and_close().await;
 }
 
@@ -948,7 +1037,8 @@ async fn server_frames_from_client_are_errors() {
 async fn body_on_frame_that_forbids_it_is_an_error() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
-    c.send_raw(b"SUBSCRIBE\nid:0\ndestination:/queue/a\n\nbody\0").await;
+    c.send_raw(b"SUBSCRIBE\nid:0\ndestination:/queue/a\n\nbody\0")
+        .await;
     c.expect_error_and_close().await;
 }
 
@@ -964,7 +1054,10 @@ async fn invalid_escape_is_a_fatal_error() {
 #[tokio::test]
 async fn oversized_frame_is_an_error() {
     let addr = start_server(ServerConfig {
-        limits: kyu::codec::Limits { max_frame_size: 1024, ..Default::default() },
+        limits: kyu::codec::Limits {
+            max_frame_size: 1024,
+            ..Default::default()
+        },
         ..ServerConfig::default()
     })
     .await;
@@ -981,7 +1074,10 @@ async fn error_frame_has_content_type_and_length_when_it_has_a_body() {
     let e = c.expect_error_and_close().await;
     if !e.body.is_empty() {
         assert!(e.header("content-type").is_some());
-        assert_eq!(e.header("content-length"), Some(e.body.len().to_string().as_str()));
+        assert_eq!(
+            e.header("content-length"),
+            Some(e.body.len().to_string().as_str())
+        );
     }
 }
 
@@ -1029,7 +1125,11 @@ async fn accepts_a_burst_of_concurrent_connections() {
     }
     let conns = set.join_all().await;
     assert_eq!(conns.len(), 3000);
-    assert!(start.elapsed() < Duration::from_millis(900), "burst took {:?}", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_millis(900),
+        "burst took {:?}",
+        start.elapsed()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,7 +1172,10 @@ async fn cumulative_ack_frees_all_covered_credit() {
     let ms = receive_bodies(&mut c, 3).await;
     c.send(ack(&ms[2])).await;
     let more = receive_bodies(&mut c, 3).await;
-    assert_eq!(more.iter().map(body).collect::<Vec<_>>(), vec!["3", "4", "5"]);
+    assert_eq!(
+        more.iter().map(body).collect::<Vec<_>>(),
+        vec!["3", "4", "5"]
+    );
     c.expect_nothing().await;
 }
 
@@ -1107,7 +1210,8 @@ async fn queue_messages_stay_queued_while_a_consumer_is_not_reading() {
     for _ in 0..500 {
         p.send(send_frame("/queue/stall", &big)).await;
     }
-    p.send_with_receipt(send_frame("/queue/stall", "last"), "done").await;
+    p.send_with_receipt(send_frame("/queue/stall", "last"), "done")
+        .await;
 
     let mut fresh = Conn::connect(addr).await;
     fresh.subscribe("0", "/queue/stall", "auto").await;
@@ -1126,8 +1230,12 @@ async fn producers_are_throttled_while_a_queue_is_full() {
     for i in 0..300 {
         p.send(send_frame("/queue/full", &i.to_string())).await;
     }
-    p.send(send_frame("/queue/full", "end").with_header("receipt", "r")).await;
-    assert!(p.try_recv(Duration::from_millis(300)).await.is_none(), "producer was not throttled");
+    p.send(send_frame("/queue/full", "end").with_header("receipt", "r"))
+        .await;
+    assert!(
+        p.try_recv(Duration::from_millis(300)).await.is_none(),
+        "producer was not throttled"
+    );
 
     let mut c = Conn::connect(addr).await;
     c.subscribe("0", "/queue/full", "auto").await;
@@ -1144,12 +1252,16 @@ async fn throttled_producer_keeps_heartbeating() {
     }))
     .await;
     let mut p = Conn::open(addr).await;
-    p.send(connect_frame().with_header("heart-beat", "0,50")).await;
+    p.send(connect_frame().with_header("heart-beat", "0,50"))
+        .await;
     p.expect_command(Command::Connected).await;
     for i in 0..50 {
         p.send(send_frame("/queue/hbfull", &i.to_string())).await;
     }
-    assert_eq!(p.next_item(Duration::from_millis(300)).await, Some(Item::Heartbeat));
+    assert_eq!(
+        p.next_item(Duration::from_millis(300)).await,
+        Some(Item::Heartbeat)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1177,7 +1289,11 @@ async fn slow_topic_subscriber_gets_newest_messages_within_backlog() {
     let mut p = Conn::connect(addr).await;
     let big = "x".repeat(64 * 1024);
     for i in 0..1000 {
-        p.send_with_receipt(send_frame("/topic/firehose", &format!("{i}:{big}")), &i.to_string()).await;
+        p.send_with_receipt(
+            send_frame("/topic/firehose", &format!("{i}:{big}")),
+            &i.to_string(),
+        )
+        .await;
     }
     p.publish("/topic/firehose", "final").await;
 
@@ -1188,7 +1304,10 @@ async fn slow_topic_subscriber_gets_newest_messages_within_backlog() {
     while let Some(m) = slow.try_recv(QUIET).await {
         got.push(body(&m));
     }
-    assert!(got.len() < 1001, "slow subscriber was buffered without bound");
+    assert!(
+        got.len() < 1001,
+        "slow subscriber was buffered without bound"
+    );
     assert_eq!(got.last().map(String::as_str), Some("final"));
 }
 
@@ -1201,12 +1320,20 @@ async fn commit_spanning_many_destinations_delivers_everything() {
     let addr = start_server(flow(|c| c.shards = 8)).await;
     let mut sub = Conn::connect(addr).await;
     for d in 0..40 {
-        sub.subscribe(&d.to_string(), &format!("/queue/span-{d}"), "client-individual").await;
+        sub.subscribe(
+            &d.to_string(),
+            &format!("/queue/span-{d}"),
+            "client-individual",
+        )
+        .await;
     }
     let mut c = Conn::connect(addr).await;
     c.send(begin("t")).await;
     for d in 0..40 {
-        c.send(send_frame(&format!("/queue/span-{d}"), &d.to_string()).with_header("transaction", "t")).await;
+        c.send(
+            send_frame(&format!("/queue/span-{d}"), &d.to_string()).with_header("transaction", "t"),
+        )
+        .await;
     }
     sub.expect_nothing().await;
     c.send_with_receipt(commit("t"), "c").await;
@@ -1221,7 +1348,9 @@ async fn commit_spanning_many_destinations_delivers_everything() {
     sub.disconnect().await;
     let mut check = Conn::connect(addr).await;
     for d in 0..40 {
-        check.subscribe(&d.to_string(), &format!("/queue/span-{d}"), "auto").await;
+        check
+            .subscribe(&d.to_string(), &format!("/queue/span-{d}"), "auto")
+            .await;
     }
     check.expect_nothing().await;
 }
@@ -1231,7 +1360,8 @@ async fn ack_id_for_another_shard_or_sequence_is_rejected() {
     let addr = start_server(flow(|c| c.shards = 4)).await;
     for bogus in ["4-1", "0-999", "1-", "-1", "x-y"] {
         let mut c = Conn::connect(addr).await;
-        c.send(Frame::new(Command::Ack).with_header("id", bogus)).await;
+        c.send(Frame::new(Command::Ack).with_header("id", bogus))
+            .await;
         c.expect_error_and_close().await;
     }
 }
@@ -1241,7 +1371,8 @@ async fn topic_copies_carry_each_subscriptions_own_headers() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
     c.subscribe("auto-sub", "/topic/shared", "auto").await;
-    c.subscribe("acked:sub", "/topic/shared", "client-individual").await;
+    c.subscribe("acked:sub", "/topic/shared", "client-individual")
+        .await;
     c.send(send_frame("/topic/shared", "one")).await;
 
     let mut seen = HashMap::new();
@@ -1263,7 +1394,8 @@ async fn topic_copies_carry_each_subscriptions_own_headers() {
 async fn producer_cannot_override_server_message_headers() {
     let addr = start_default_server().await;
     let mut c = Conn::connect(addr).await;
-    c.subscribe("real", "/queue/spoof", "client-individual").await;
+    c.subscribe("real", "/queue/spoof", "client-individual")
+        .await;
     c.send(
         send_frame("/queue/spoof", "x")
             .with_header("subscription", "fake")
@@ -1276,7 +1408,8 @@ async fn producer_cannot_override_server_message_headers() {
     assert_ne!(m.header("message-id"), Some("fake"));
     let ack = m.header("ack").unwrap().to_string();
     assert_ne!(ack, "fake");
-    c.send_with_receipt(Frame::new(Command::Ack).with_header("id", &ack), "acked").await;
+    c.send_with_receipt(Frame::new(Command::Ack).with_header("id", &ack), "acked")
+        .await;
 }
 
 #[tokio::test]

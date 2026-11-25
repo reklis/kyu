@@ -12,9 +12,17 @@
 //! Latency is measured from just before SEND to MESSAGE arrival, using a
 //! timestamp header (so producers and consumers must share a process).
 
+// Timestamps and rates are measurements: nanosecond counts as u64 and f64
+// arithmetic for rates and percentiles lose nothing that matters here.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use kyu::client::{AckMode, Client, ConnectOptions, OutgoingMessage};
@@ -31,7 +39,11 @@ static RUN: AtomicU64 = AtomicU64::new(0);
 /// Destination names unique across runs, so state a long-lived broker kept
 /// from an earlier run (e.g. a slow-consumer backlog) cannot skew this one.
 fn unique(prefix: &str) -> String {
-    format!("{prefix}-{}-{}", std::process::id(), RUN.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        RUN.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// CONNECT settings for external brokers: `--host`, `--login`, `--passcode`.
@@ -49,7 +61,10 @@ fn opts() -> ConnectOptions {
 /// Removes `--name value` from `args`, returning the value.
 fn take_flag(args: &mut Vec<String>, name: &str) -> Option<String> {
     let i = args.iter().position(|a| a == name)?;
-    let v = args.get(i + 1).cloned().unwrap_or_else(|| panic!("{name} needs a value"));
+    let v = args
+        .get(i + 1)
+        .cloned()
+        .unwrap_or_else(|| panic!("{name} needs a value"));
     args.drain(i..=i + 1);
     Some(v)
 }
@@ -67,7 +82,12 @@ impl Latencies {
             let i = ((self.0.len() as f64 * p) as usize).min(self.0.len() - 1);
             Duration::from_nanos(self.0[i])
         };
-        format!("p50 {:>9.2?}  p99 {:>9.2?}  max {:>9.2?}", pct(0.50), pct(0.99), pct(1.0))
+        format!(
+            "p50 {:>9.2?}  p99 {:>9.2?}  max {:>9.2?}",
+            pct(0.50),
+            pct(0.99),
+            pct(1.0)
+        )
     }
 }
 
@@ -76,11 +96,24 @@ fn rate(n: u64, elapsed: Duration) -> f64 {
 }
 
 fn human(n: f64) -> String {
-    if n >= 1e6 { format!("{:.2}M", n / 1e6) } else if n >= 1e3 { format!("{:.1}k", n / 1e3) } else { format!("{n:.0}") }
+    if n >= 1e6 {
+        format!("{:.2}M", n / 1e6)
+    } else if n >= 1e3 {
+        format!("{:.1}k", n / 1e3)
+    } else {
+        format!("{n:.0}")
+    }
 }
 
 /// P producers -> one queue -> C consumers.
-async fn queue(addr: SocketAddr, producers: usize, consumers: usize, size: usize, total: u64, ack: AckMode) {
+async fn queue(
+    addr: SocketAddr,
+    producers: usize,
+    consumers: usize,
+    size: usize,
+    total: u64,
+    ack: AckMode,
+) {
     let dest = format!("/queue/{}", unique("bench"));
     let epoch = Instant::now();
     let received = Arc::new(AtomicU64::new(0));
@@ -99,7 +132,9 @@ async fn queue(addr: SocketAddr, producers: usize, consumers: usize, size: usize
         cons.spawn(async move {
             let mut local = Vec::new();
             while received.load(Ordering::Relaxed) < total {
-                let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(500), sub.recv()).await else {
+                let Ok(Some(m)) =
+                    tokio::time::timeout(Duration::from_millis(500), sub.recv()).await
+                else {
                     continue;
                 };
                 let sent: u64 = m.header("x-t").unwrap().parse().unwrap();
@@ -125,9 +160,13 @@ async fn queue(addr: SocketAddr, producers: usize, consumers: usize, size: usize
             let c = Client::connect(addr, opts()).await.unwrap();
             for _ in 0..per {
                 let t = epoch.elapsed().as_nanos() as u64;
-                c.send(OutgoingMessage::new(&dest).header("x-t", t.to_string()).body(body.clone()))
-                    .await
-                    .unwrap();
+                c.send(
+                    OutgoingMessage::new(&dest)
+                        .header("x-t", t.to_string())
+                        .body(body.clone()),
+                )
+                .await
+                .unwrap();
             }
             c.disconnect().await.ok();
         });
@@ -172,14 +211,19 @@ async fn parallel(addr: SocketAddr, pairs: usize, per_pair: u64) {
         });
         set.spawn(async move {
             for _ in 0..per_pair {
-                p.send(OutgoingMessage::new(&dest).body(body.clone())).await.unwrap();
+                p.send(OutgoingMessage::new(&dest).body(body.clone()))
+                    .await
+                    .unwrap();
             }
             p.disconnect().await.ok();
         });
     }
     set.join_all().await;
     let n = per_pair * pairs as u64;
-    println!("  {pairs:>3} pairs x {per_pair} msgs   deliver {:>7}/s", human(rate(n, start.elapsed())));
+    println!(
+        "  {pairs:>3} pairs x {per_pair} msgs   deliver {:>7}/s",
+        human(rate(n, start.elapsed()))
+    );
 }
 
 /// D queues with one consumer each; P producers spray messages round-robin
@@ -191,7 +235,10 @@ async fn destinations(addr: SocketAddr, dests: usize, producers: usize, total: u
     let mut consumers = Vec::new();
     for d in 0..dests {
         let c = Client::connect(addr, opts()).await.unwrap();
-        let sub = c.subscribe(&format!("/queue/{prefix}-{d}"), AckMode::Auto).await.unwrap();
+        let sub = c
+            .subscribe(&format!("/queue/{prefix}-{d}"), AckMode::Auto)
+            .await
+            .unwrap();
         consumers.push((c, sub));
     }
     let start = Instant::now();
@@ -210,7 +257,9 @@ async fn destinations(addr: SocketAddr, dests: usize, producers: usize, total: u
             let c = Client::connect(addr, opts()).await.unwrap();
             for i in 0..per_producer {
                 let d = (p as u64 * per_producer + i) % dests as u64;
-                c.send(OutgoingMessage::new(format!("/queue/{prefix}-{d}")).body("x".repeat(128))).await.unwrap();
+                c.send(OutgoingMessage::new(format!("/queue/{prefix}-{d}")).body("x".repeat(128)))
+                    .await
+                    .unwrap();
             }
             c.disconnect().await.ok();
         });
@@ -235,9 +284,20 @@ fn proc_file(name: &str) -> String {
 /// CPU seconds (user + system) used by the measured process so far.
 fn cpu_seconds() -> f64 {
     let stat = proc_file("stat");
-    let fields: Vec<&str> = stat.rsplit(')').next().unwrap_or("").split_whitespace().collect();
-    let ticks: f64 = fields.get(11).and_then(|u| u.parse::<f64>().ok()).unwrap_or(0.0)
-        + fields.get(12).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let fields: Vec<&str> = stat
+        .rsplit(')')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    let ticks: f64 = fields
+        .get(11)
+        .and_then(|u| u.parse::<f64>().ok())
+        .unwrap_or(0.0)
+        + fields
+            .get(12)
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
     ticks / 100.0
 }
 
@@ -256,20 +316,33 @@ fn rss_mb() -> f64 {
 async fn idle(addr: SocketAddr, clients: usize, ms: u32, hold: Duration) {
     let mut set = JoinSet::new();
     for _ in 0..clients {
-        set.spawn(async move { Client::connect(addr, opts().heartbeat(ms, ms)).await.unwrap() });
+        set.spawn(async move {
+            Client::connect(addr, opts().heartbeat(ms, ms))
+                .await
+                .unwrap()
+        });
     }
     let cs: Vec<Client> = set.join_all().await;
     // The rate actually agreed: each direction uses the larger of the two
     // sides' settings (servers may insist on a slower rate than we ask for).
     let (sx, sy) = cs[0].connected().heartbeat;
-    let agreed = |server: u32| if server == 0 { "off".to_string() } else { format!("{}ms", server.max(ms)) };
+    let agreed = |server: u32| {
+        if server == 0 {
+            "off".to_string()
+        } else {
+            format!("{}ms", server.max(ms))
+        }
+    };
     let (send, recv) = (agreed(sx), agreed(sy));
     let cpu0 = cpu_seconds();
     tokio::time::sleep(hold).await;
     let cpu = cpu_seconds() - cpu0;
     let mut alive = 0;
     for c in &cs {
-        if tokio::time::timeout(Duration::from_millis(1), c.closed()).await.is_err() {
+        if tokio::time::timeout(Duration::from_millis(1), c.closed())
+            .await
+            .is_err()
+        {
             alive += 1;
         }
     }
@@ -299,7 +372,9 @@ async fn slow_consumer(addr: SocketAddr, rate_per_sec: u64, run: Duration, ack: 
             let p = Client::connect(addr, opts()).await.unwrap();
             let body = bytes::Bytes::from(vec![b'x'; 1024]);
             while !stop.load(Ordering::Relaxed) {
-                p.send(OutgoingMessage::new(&dest).body(body.clone())).await.unwrap();
+                p.send(OutgoingMessage::new(&dest).body(body.clone()))
+                    .await
+                    .unwrap();
                 sent.fetch_add(1, Ordering::Relaxed);
             }
             p.disconnect().await.ok();
@@ -325,13 +400,13 @@ async fn slow_consumer(addr: SocketAddr, rate_per_sec: u64, run: Duration, ack: 
     // A throttled producer may be blocked in send(); drop it.
     producer.abort();
     let _ = producer.await;
-    let produced = sent.load(Ordering::Relaxed);
+    let total_sent = sent.load(Ordering::Relaxed);
     println!(
         "  {:<17} produced {:>8}  consumed {:>7}  backlog {:>8}  RSS +{:.0} MB (peak)",
         format!("{ack:?}"),
-        produced,
+        total_sent,
         got,
-        produced.saturating_sub(got),
+        total_sent.saturating_sub(got),
         peak - rss0
     );
     drop(sub);
@@ -356,8 +431,8 @@ async fn fanout(addr: SocketAddr, subscribers: usize, messages: u64) {
             let mut local = Vec::with_capacity(messages as usize);
             for _ in 0..messages {
                 let m = sub.recv().await.unwrap();
-                let sent: u64 = m.header("x-t").unwrap().parse().unwrap();
-                local.push(epoch.elapsed().as_nanos() as u64 - sent);
+                let sent_at: u64 = m.header("x-t").unwrap().parse().unwrap();
+                local.push(epoch.elapsed().as_nanos() as u64 - sent_at);
             }
             lat.lock().await.0.extend(local);
             c.disconnect().await.ok();
@@ -367,7 +442,13 @@ async fn fanout(addr: SocketAddr, subscribers: usize, messages: u64) {
     let start = Instant::now();
     for _ in 0..messages {
         let t = epoch.elapsed().as_nanos() as u64;
-        p.send(OutgoingMessage::new(&dest).header("x-t", t.to_string()).body("x".repeat(128))).await.unwrap();
+        p.send(
+            OutgoingMessage::new(&dest)
+                .header("x-t", t.to_string())
+                .body("x".repeat(128)),
+        )
+        .await
+        .unwrap();
     }
     set.join_all().await;
     let elapsed = start.elapsed();
@@ -379,7 +460,7 @@ async fn fanout(addr: SocketAddr, subscribers: usize, messages: u64) {
 }
 
 /// N clients connect concurrently, then each does K request/response round
-/// trips (send_confirmed to its own queue, then receive the message) at once.
+/// trips (`send_confirmed` to its own queue, then receive the message) at once.
 async fn connections(addr: SocketAddr, clients: usize, rounds: usize) {
     let start = Instant::now();
     let mut set = JoinSet::new();
@@ -410,7 +491,9 @@ async fn connections(addr: SocketAddr, clients: usize, rounds: usize) {
             let mut local = Vec::with_capacity(rounds);
             for _ in 0..rounds {
                 let t = Instant::now();
-                c.send_confirmed(OutgoingMessage::new(&dest).body("ping")).await.unwrap();
+                c.send_confirmed(OutgoingMessage::new(&dest).body("ping"))
+                    .await
+                    .unwrap();
                 sub.recv().await.unwrap();
                 local.push(t.elapsed().as_nanos() as u64);
             }
@@ -444,12 +527,31 @@ async fn rtt(addr: SocketAddr, rounds: usize) {
     let start = Instant::now();
     for _ in 0..rounds {
         let t = Instant::now();
-        c.send(OutgoingMessage::new(&dest).body("ping")).await.unwrap();
+        c.send(OutgoingMessage::new(&dest).body("ping"))
+            .await
+            .unwrap();
         sub.recv().await.unwrap();
         lat.0.push(t.elapsed().as_nanos() as u64);
     }
-    println!("  {rounds} sequential send->message round trips: {:>7}/s   {}", human(rate(rounds as u64, start.elapsed())), lat.report());
+    println!(
+        "  {rounds} sequential send->message round trips: {:>7}/s   {}",
+        human(rate(rounds as u64, start.elapsed())),
+        lat.report()
+    );
     c.disconnect().await.ok();
+}
+
+/// Runs a server in this process; its CPU and memory are then measured as ours.
+async fn start_server() -> SocketAddr {
+    // Heart-beats only happen when a client asks for them.
+    let config = ServerConfig {
+        heartbeat: (100, 100),
+        ..ServerConfig::default()
+    };
+    let server = Server::bind("127.0.0.1:0", config).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(server.run());
+    addr
 }
 
 #[tokio::main]
@@ -458,24 +560,22 @@ async fn main() {
     let host = take_flag(&mut args, "--host").unwrap_or_else(|| "localhost".into());
     let login = take_flag(&mut args, "--login");
     let passcode = take_flag(&mut args, "--passcode");
-    CONNECT.set((host, login.map(|l| (l, passcode.unwrap_or_default())))).unwrap();
+    CONNECT
+        .set((host, login.map(|l| (l, passcode.unwrap_or_default()))))
+        .unwrap();
     if let Some(pid) = take_flag(&mut args, "--server-pid") {
         MEASURED.set(pid).unwrap();
     }
     let addr = match take_flag(&mut args, "--addr") {
         Some(a) => a.parse().expect("--addr host:port"),
-        None => {
-            // Heart-beats only happen when a client asks for them.
-            let config = ServerConfig { heartbeat: (100, 100), ..ServerConfig::default() };
-            let server = Server::bind("127.0.0.1:0", config).await.unwrap();
-            let addr = server.local_addr().unwrap();
-            tokio::spawn(server.run());
-            addr
-        }
+        None => start_server().await,
     };
     let all = args.is_empty();
     let want = |s: &str| all || args.iter().any(|a| a == s);
-    println!("kyu load test against {addr} ({} worker threads)", std::thread::available_parallelism().unwrap());
+    println!(
+        "kyu load test against {addr} ({} worker threads)",
+        std::thread::available_parallelism().unwrap()
+    );
 
     if want("rtt") {
         println!("\n[rtt] single-connection latency");
@@ -532,8 +632,16 @@ async fn main() {
         }
     }
     if want("slowconsumer") {
-        println!("\n[slowconsumer] 1 KiB messages, consumer limited to 2k msg/s for 3s (server RSS)");
+        println!(
+            "\n[slowconsumer] 1 KiB messages, consumer limited to 2k msg/s for 3s (server RSS)"
+        );
         slow_consumer(addr, 2_000, Duration::from_secs(3), AckMode::Auto).await;
-        slow_consumer(addr, 2_000, Duration::from_secs(3), AckMode::ClientIndividual).await;
+        slow_consumer(
+            addr,
+            2_000,
+            Duration::from_secs(3),
+            AckMode::ClientIndividual,
+        )
+        .await;
     }
 }

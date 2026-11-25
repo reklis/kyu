@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -30,7 +31,7 @@ pub async fn start_default_server() -> SocketAddr {
 pub struct Conn {
     pub framed: Framed<TcpStream, StompCodec>,
     /// Frames that arrived while waiting for a specific RECEIPT.
-    pub held: std::collections::VecDeque<Frame>,
+    pub held: VecDeque<Frame>,
 }
 
 impl Conn {
@@ -39,7 +40,10 @@ impl Conn {
     }
 
     pub fn from_stream(stream: TcpStream) -> Conn {
-        Conn { framed: Framed::new(stream, StompCodec::new()), held: Default::default() }
+        Conn {
+            framed: Framed::new(stream, StompCodec::new()),
+            held: VecDeque::new(),
+        }
     }
 
     /// Opens a connection and completes a standard 1.2 CONNECT handshake.
@@ -56,11 +60,18 @@ impl Conn {
     }
 
     pub async fn send_heartbeat(&mut self) {
-        self.framed.send(Item::Heartbeat).await.expect("send heartbeat");
+        self.framed
+            .send(Item::Heartbeat)
+            .await
+            .expect("send heartbeat");
     }
 
     pub async fn send_raw(&mut self, bytes: &[u8]) {
-        self.framed.get_mut().write_all(bytes).await.expect("raw write");
+        self.framed
+            .get_mut()
+            .write_all(bytes)
+            .await
+            .expect("raw write");
     }
 
     /// Next item (frame or heartbeat), or None on close/timeout.
@@ -89,7 +100,7 @@ impl Conn {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             match timeout(left, self.framed.next()).await {
                 Ok(Some(Ok(Item::Frame(f)))) => return Some(f),
-                Ok(Some(Ok(Item::Heartbeat))) => continue,
+                Ok(Some(Ok(Item::Heartbeat))) => {}
                 _ => return None,
             }
         }
@@ -113,10 +124,10 @@ impl Conn {
         loop {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             match timeout(left, self.framed.next()).await {
-                Ok(None) | Ok(Some(Err(_))) => return,
-                Ok(Some(Ok(Item::Heartbeat))) => continue,
+                Ok(None | Some(Err(_))) => return,
+                Ok(Some(Ok(Item::Heartbeat))) => {}
                 Ok(Some(Ok(Item::Frame(f)))) => panic!("expected close, got frame {f:?}"),
-                Err(_) => panic!("connection was not closed"),
+                Err(elapsed) => panic!("connection was not closed: {elapsed}"),
             }
         }
     }
@@ -140,7 +151,11 @@ impl Conn {
             if f.command == Command::Receipt && f.header("receipt-id") == Some(receipt) {
                 return;
             }
-            assert_ne!(f.command, Command::Error, "got ERROR waiting for receipt: {f:?}");
+            assert_ne!(
+                f.command,
+                Command::Error,
+                "got ERROR waiting for receipt: {f:?}"
+            );
             self.held.push_back(f);
         }
     }
@@ -157,11 +172,13 @@ impl Conn {
     }
 
     pub async fn publish(&mut self, dest: &str, body: &str) {
-        self.send_with_receipt(send_frame(dest, body), &format!("pub-{body}")).await;
+        self.send_with_receipt(send_frame(dest, body), &format!("pub-{body}"))
+            .await;
     }
 
     pub async fn disconnect(mut self) {
-        self.send_with_receipt(Frame::new(Command::Disconnect), "bye").await;
+        self.send_with_receipt(Frame::new(Command::Disconnect), "bye")
+            .await;
         self.expect_closed().await;
     }
 }

@@ -17,6 +17,9 @@ pub struct Str(Bytes);
 
 impl Str {
     /// Wraps bytes after checking they are UTF-8.
+    ///
+    /// # Errors
+    /// If `bytes` is not valid UTF-8.
     pub fn from_utf8(bytes: Bytes) -> Result<Str, std::str::Utf8Error> {
         std::str::from_utf8(&bytes)?;
         Ok(Str(bytes))
@@ -32,6 +35,7 @@ impl Str {
     }
 
     /// A string with static lifetime: no allocation.
+    #[must_use]
     pub const fn from_static(s: &'static str) -> Str {
         Str(Bytes::from_static(s.as_bytes()))
     }
@@ -69,7 +73,7 @@ impl Borrow<str> for Str {
 // Must agree with `str`'s Hash so that `Borrow<str>` lookups work.
 impl Hash for Str {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state)
+        self.as_str().hash(state);
     }
 }
 
@@ -162,6 +166,7 @@ pub enum Command {
 
 impl Command {
     /// Parses a command line. Commands are case sensitive.
+    #[must_use]
     pub fn parse(s: &str) -> Command {
         match s {
             "CONNECT" => Command::Connect,
@@ -183,6 +188,7 @@ impl Command {
         }
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
             Command::Connect => "CONNECT",
@@ -205,11 +211,13 @@ impl Command {
     }
 
     /// Only SEND, MESSAGE and ERROR frames may carry a body.
+    #[must_use]
     pub fn allows_body(&self) -> bool {
         matches!(self, Command::Send | Command::Message | Command::Error)
     }
 
     /// CONNECT and CONNECTED headers are not escaped (STOMP 1.0 compatibility).
+    #[must_use]
     pub fn escapes_headers(&self) -> bool {
         !matches!(self, Command::Connect | Command::Connected)
     }
@@ -223,15 +231,22 @@ pub struct Frame {
 }
 
 impl Frame {
+    #[must_use]
     pub fn new(command: Command) -> Frame {
-        Frame { command, headers: Vec::new(), body: Bytes::new() }
+        Frame {
+            command,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        }
     }
 
+    #[must_use]
     pub fn with_header(mut self, name: impl Into<Str>, value: impl Into<Str>) -> Frame {
         self.headers.push((name.into(), value.into()));
         self
     }
 
+    #[must_use]
     pub fn with_body(mut self, body: impl Into<Bytes>) -> Frame {
         self.body = body.into();
         self

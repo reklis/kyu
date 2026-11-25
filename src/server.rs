@@ -7,7 +7,7 @@
 //!   subscriber (round robin) and is held until someone subscribes;
 //! * unacknowledged queue messages are redelivered when their subscription
 //!   ends (UNSUBSCRIBE, DISCONNECT or connection failure);
-//! * NACKed messages are discarded.
+//! * messages rejected with NACK are discarded.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -28,7 +28,7 @@ use crate::frame::{Command, Frame, Str};
 use crate::transport::{Activity, Heartbeats, Tick, negotiate, parse_heartbeat};
 
 /// Hash maps keyed by client-chosen strings (destinations, subscription
-/// ids): foldhash is several times faster than SipHash and still randomly
+/// ids): foldhash is several times faster than `SipHash` and still randomly
 /// seeded per process, so clients cannot precompute colliding keys.
 type HashMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
 
@@ -82,6 +82,10 @@ pub struct Server {
 }
 
 impl Server {
+    /// Binds the listening socket (the first address that works).
+    ///
+    /// # Errors
+    /// If no address resolves or none can be bound.
     pub async fn bind(addr: impl ToSocketAddrs, config: ServerConfig) -> io::Result<Server> {
         let mut last_err = None;
         for addr in tokio::net::lookup_host(addr).await? {
@@ -97,9 +101,14 @@ impl Server {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addresses to bind")))
+        Err(last_err
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addresses to bind")))
     }
 
+    /// The address actually bound (useful after binding port 0).
+    ///
+    /// # Errors
+    /// As for [`TcpListener::local_addr`].
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
@@ -107,13 +116,10 @@ impl Server {
     /// Accepts connections forever.
     pub async fn run(self) {
         loop {
-            let stream = match self.listener.accept().await {
-                Ok((stream, _)) => stream,
-                Err(_) => {
-                    // e.g. out of file descriptors: back off instead of spinning
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
-                }
+            let Ok((stream, _)) = self.listener.accept().await else {
+                // e.g. out of file descriptors: back off instead of spinning
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
             };
             let _ = stream.set_nodelay(true);
             let broker = self.broker.clone();
@@ -126,7 +132,11 @@ impl Server {
 }
 
 fn listen(addr: SocketAddr, backlog: u32) -> io::Result<TcpListener> {
-    let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
     socket.listen(backlog)
@@ -163,8 +173,17 @@ impl StoredMessage {
     /// first, so a producer cannot override them (the first value wins).
     fn from_send(id: (ConnId, u64), destination: Str, frame: Frame) -> StoredMessage {
         use std::fmt::Write;
-        let user = |k: &str| !matches!(k, "destination" | "transaction" | "receipt" | "content-length");
-        let len: usize = frame.headers.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+        let user = |k: &str| {
+            !matches!(
+                k,
+                "destination" | "transaction" | "receipt" | "content-length"
+            )
+        };
+        let len: usize = frame
+            .headers
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 2)
+            .sum();
         let mut head = BytesMut::with_capacity(len + destination.len() + 64);
         let _ = write!(head, "message-id:{}-{}\ndestination:", id.0, id.1);
         escape_into(&destination, &mut head);
@@ -179,7 +198,11 @@ impl StoredMessage {
             let _ = writeln!(head, "content-length:{}", frame.body.len());
         }
         head.put_u8(b'\n');
-        StoredMessage { destination, head: head.freeze(), body: frame.body }
+        StoredMessage {
+            destination,
+            head: head.freeze(),
+            body: frame.body,
+        }
     }
 }
 
@@ -308,7 +331,14 @@ impl Broker {
     fn new(config: &ServerConfig) -> Broker {
         let n = config.shards.max(1);
         Broker {
-            shards: (0..n).map(|index| Mutex::new(Shard { index, ..Shard::default() })).collect(),
+            shards: (0..n)
+                .map(|index| {
+                    Mutex::new(Shard {
+                        index,
+                        ..Shard::default()
+                    })
+                })
+                .collect(),
             flow: FlowLimits {
                 prefetch: config.prefetch.max(1),
                 max_in_flight: config.max_in_flight.max(1),
@@ -321,15 +351,26 @@ impl Broker {
     fn shard_of(&self, destination: &str) -> usize {
         use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
         let h = BuildHasherDefault::<DefaultHasher>::default().hash_one(destination);
-        (h % self.shards.len() as u64) as usize
+        // Truncating the hash is fine: any bits pick a shard uniformly.
+        #[allow(clippy::cast_possible_truncation)]
+        let h = h as usize;
+        h % self.shards.len()
     }
 
     fn lock(&self, shard: usize) -> std::sync::MutexGuard<'_, Shard> {
         self.shards[shard].lock().unwrap()
     }
 
-    fn subscribe(&self, conn: &ConnHandle, shard: usize, id: &str, destination: &str, ack: AckMode) {
-        self.lock(shard).subscribe(&self.flow, conn, id, destination, ack);
+    fn subscribe(
+        &self,
+        conn: &ConnHandle,
+        shard: usize,
+        id: &str,
+        destination: &str,
+        ack: AckMode,
+    ) {
+        self.lock(shard)
+            .subscribe(&self.flow, conn, id, destination, ack);
     }
 
     fn unsubscribe(&self, conn: ConnId, shard: usize, id: &str) {
@@ -358,7 +399,10 @@ impl Broker {
     /// on the same shard share one lock acquisition.
     fn apply_batch(&self, conn: ConnId, ops: Vec<Op>) -> Option<Throttle> {
         let mut throttle = None;
-        let mut ops = ops.into_iter().map(|op| (self.op_shard(&op), op)).peekable();
+        let mut ops = ops
+            .into_iter()
+            .map(|op| (self.op_shard(&op), op))
+            .peekable();
         while let Some((shard, op)) = ops.next() {
             let mut sh = self.lock(shard);
             if let Some(t) = sh.run(&self.flow, conn, op) {
@@ -410,11 +454,16 @@ impl Broker {
 
     fn has_space(&self, destination: &str) -> bool {
         let sh = self.lock(self.shard_of(destination));
-        sh.destinations.get(destination).is_none_or(|d| d.pending.len() < self.flow.max_queue_depth)
+        sh.destinations
+            .get(destination)
+            .is_none_or(|d| d.pending.len() < self.flow.max_queue_depth)
     }
 
     fn is_outstanding(&self, conn: ConnId, shard: usize, seq: u64) -> bool {
-        self.lock(shard).conns.get(&conn).is_some_and(|c| c.ack_index.contains_key(&seq))
+        self.lock(shard)
+            .conns
+            .get(&conn)
+            .is_some_and(|c| c.ack_index.contains_key(&seq))
     }
 
     /// Called when a connection that hit its in-flight limit has room again.
@@ -449,7 +498,14 @@ impl Shard {
         }
     }
 
-    fn subscribe(&mut self, flow: &FlowLimits, conn: &ConnHandle, id: &str, destination: &str, ack: AckMode) {
+    fn subscribe(
+        &mut self,
+        flow: &FlowLimits,
+        conn: &ConnHandle,
+        id: &str,
+        destination: &str,
+        ack: AckMode,
+    ) {
         let c = self.conns.entry(conn.id).or_insert_with(|| ConnShard {
             handle: conn.clone(),
             subs: HashMap::default(),
@@ -474,12 +530,17 @@ impl Shard {
     }
 
     fn remove_sub(&mut self, flow: &FlowLimits, conn: ConnId, id: &str) {
-        let Some(c) = self.conns.get_mut(&conn) else { return };
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
         let Some(sub) = c.subs.remove(id) else { return };
         for seq in sub.unacked.keys() {
             c.ack_index.remove(seq);
         }
-        let dest = self.destinations.get_mut(&sub.destination).expect("destination exists");
+        let dest = self
+            .destinations
+            .get_mut(&sub.destination)
+            .expect("destination exists");
         dest.subscribers.retain(|(c, s)| !(*c == conn && s == id));
         if !is_topic(&sub.destination) {
             for (_, msg) in sub.unacked.into_iter().rev() {
@@ -491,37 +552,64 @@ impl Shard {
 
     fn publish(&mut self, flow: &FlowLimits, msg: Msg) -> Option<Throttle> {
         if is_topic(&msg.destination) {
-            let Shard { index, conns, destinations, seq } = self;
-            if let Some(dest) = destinations.get(msg.destination.as_str()) {
-                for (conn, sub_id) in &dest.subscribers {
-                    if let Some(c) = conns.get_mut(conn) {
-                        offer_topic(flow, *index, seq, c, sub_id, &msg);
-                    }
-                }
-            }
+            self.broadcast(flow, &msg);
             None
         } else {
-            let held = msg.clone();
-            let name = held.destination.as_str();
-            let dest = match self.destinations.get_mut(name) {
-                Some(d) => d,
-                None => self.destinations.entry(name.to_string()).or_default(),
-            };
-            dest.pending.push_back(msg);
-            self.dispatch(flow, name);
-            let dest = self.destinations.get_mut(name).unwrap();
-            if dest.pending.len() >= flow.max_queue_depth {
-                dest.throttling = true;
-                return Some(Throttle { destination: name.to_string(), space: dest.space.clone() });
-            }
-            None
+            self.enqueue(flow, msg)
         }
+    }
+
+    /// Offers a topic message to every current subscriber.
+    fn broadcast(&mut self, flow: &FlowLimits, msg: &Msg) {
+        let Shard {
+            index,
+            conns,
+            destinations,
+            seq,
+        } = self;
+        let Some(dest) = destinations.get(msg.destination.as_str()) else {
+            return;
+        };
+        for (conn, sub_id) in &dest.subscribers {
+            if let Some(c) = conns.get_mut(conn) {
+                offer_topic(flow, *index, seq, c, sub_id, msg);
+            }
+        }
+    }
+
+    /// Queues a message and dispatches what it can. Returns a throttle if
+    /// the queue is now full.
+    fn enqueue(&mut self, flow: &FlowLimits, msg: Msg) -> Option<Throttle> {
+        let held = msg.clone();
+        let name = held.destination.as_str();
+        let dest = match self.destinations.get_mut(name) {
+            Some(d) => d,
+            None => self.destinations.entry(name.to_string()).or_default(),
+        };
+        dest.pending.push_back(msg);
+        self.dispatch(flow, name);
+        let dest = self.destinations.get_mut(name).unwrap();
+        if dest.pending.len() < flow.max_queue_depth {
+            return None;
+        }
+        dest.throttling = true;
+        Some(Throttle {
+            destination: name.to_string(),
+            space: dest.space.clone(),
+        })
     }
 
     /// Hands pending queue messages to subscribers with room, round robin.
     fn dispatch(&mut self, flow: &FlowLimits, dest_name: &str) {
-        let Shard { index, conns, destinations, seq } = self;
-        let Some(dest) = destinations.get_mut(dest_name) else { return };
+        let Shard {
+            index,
+            conns,
+            destinations,
+            seq,
+        } = self;
+        let Some(dest) = destinations.get_mut(dest_name) else {
+            return;
+        };
         while !dest.pending.is_empty() && !dest.subscribers.is_empty() {
             let n = dest.subscribers.len();
             let mut chosen = None;
@@ -551,8 +639,12 @@ impl Shard {
     /// Gives a subscriber that gained room as much as it can now take.
     fn refill(&mut self, flow: &FlowLimits, conn: ConnId, sub_id: &str) {
         let (index, seq) = (self.index, &mut self.seq);
-        let Some(c) = self.conns.get_mut(&conn) else { return };
-        let Some(sub) = c.subs.get(sub_id) else { return };
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        let Some(sub) = c.subs.get(sub_id) else {
+            return;
+        };
         if is_topic(&sub.destination) {
             loop {
                 let sub = c.subs.get(sub_id).unwrap();
@@ -568,12 +660,18 @@ impl Shard {
         }
     }
 
-    /// Removes an acknowledged (or NACKed) message, and for `client` mode
+    /// Removes an acknowledged (or rejected) message, and for `client` mode
     /// every earlier message on the same subscription; then refills it.
     fn settle(&mut self, flow: &FlowLimits, conn: ConnId, seq: u64) {
-        let Some(c) = self.conns.get_mut(&conn) else { return };
-        let Some(sub_id) = c.ack_index.remove(&seq) else { return };
-        let Some(sub) = c.subs.get_mut(&sub_id) else { return };
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        let Some(sub_id) = c.ack_index.remove(&seq) else {
+            return;
+        };
+        let Some(sub) = c.subs.get_mut(&sub_id) else {
+            return;
+        };
         match sub.ack {
             AckMode::Client => {
                 let later = sub.unacked.split_off(&(seq + 1));
@@ -591,8 +689,17 @@ impl Shard {
 }
 
 /// Delivers a topic message now, or buffers it if the subscriber is busy.
-fn offer_topic(flow: &FlowLimits, shard: usize, seq: &mut u64, c: &mut ConnShard, sub_id: &str, msg: &Msg) {
-    let Some(sub) = c.subs.get(sub_id) else { return };
+fn offer_topic(
+    flow: &FlowLimits,
+    shard: usize,
+    seq: &mut u64,
+    c: &mut ConnShard,
+    sub_id: &str,
+    msg: &Msg,
+) {
+    let Some(sub) = c.subs.get(sub_id) else {
+        return;
+    };
     if sub.backlog.is_empty() && can_take(flow, c, sub) {
         deliver(shard, seq, c, sub_id, msg.clone());
     } else if flow.topic_backlog > 0 {
@@ -605,7 +712,9 @@ fn offer_topic(flow: &FlowLimits, shard: usize, seq: &mut u64, c: &mut ConnShard
 }
 
 fn deliver(shard: usize, seq: &mut u64, c: &mut ConnShard, sub_id: &str, msg: Msg) {
-    let Some(sub) = c.subs.get_mut(sub_id) else { return };
+    let Some(sub) = c.subs.get_mut(sub_id) else {
+        return;
+    };
     let ack = if sub.ack == AckMode::Auto {
         None
     } else {
@@ -615,7 +724,11 @@ fn deliver(shard: usize, seq: &mut u64, c: &mut ConnShard, sub_id: &str, msg: Ms
         Some((shard, *seq))
     };
     c.handle.in_flight.fetch_add(1, Ordering::Relaxed);
-    let _ = c.handle.tx.send(Delivery { prefix: sub.prefix.clone(), ack, msg });
+    let _ = c.handle.tx.send(Delivery {
+        prefix: sub.prefix.clone(),
+        ack,
+        msg,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -631,7 +744,11 @@ struct Fatal {
 
 impl Fatal {
     fn new(message: impl Into<String>) -> Fatal {
-        Fatal { message: message.into(), detail: None, extra: Vec::new() }
+        Fatal {
+            message: message.into(),
+            detail: None,
+            extra: Vec::new(),
+        }
     }
     fn detail(mut self, d: impl Into<String>) -> Fatal {
         self.detail = Some(d.into());
@@ -644,12 +761,12 @@ impl Fatal {
 }
 
 fn required<'a>(frame: &'a Frame, name: &str) -> Result<&'a str, Fatal> {
-    frame
-        .header(name)
-        .ok_or_else(|| Fatal::new(format!("missing required header '{name}'")).detail(format!(
+    frame.header(name).ok_or_else(|| {
+        Fatal::new(format!("missing required header '{name}'")).detail(format!(
             "{} frames require a '{name}' header",
             frame.command.as_str()
-        )))
+        ))
+    })
 }
 
 type Conn = Framed<Activity<TcpStream>, StompCodec>;
@@ -676,47 +793,40 @@ enum Flow {
 }
 
 impl Session {
-    async fn run(stream: TcpStream, broker: Arc<Broker>, config: Arc<ServerConfig>) {
-        let mut conn: Conn = Framed::new(
-            Activity::new(stream),
-            StompCodec::with_limits(config.limits),
-        );
-
-        // --- handshake ---
-        let connect = loop {
-            match conn.next().await {
-                Some(Ok(Item::Heartbeat)) => continue,
-                Some(Ok(Item::Frame(f))) => break f,
-                Some(Err(e)) => return close_with_error(conn, Fatal::new(e.to_string())).await,
-                None => return,
-            }
+    fn new(id: ConnId, broker: Arc<Broker>) -> (Session, mpsc::UnboundedReceiver<Delivery>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handle = ConnHandle {
+            id,
+            tx,
+            in_flight: Arc::new(AtomicUsize::new(0)),
         };
-        let (hb_out, hb_in) = match handshake(&connect, &config) {
-            Ok(v) => v,
-            Err(fatal) => return close_with_error(conn, fatal).await,
-        };
-
-        let id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
-        let connected = Frame::new(Command::Connected)
-            .with_header("version", "1.2")
-            .with_header("session", format!("session-{id}"))
-            .with_header("server", SERVER_NAME)
-            .with_header("heart-beat", format!("{},{}", config.heartbeat.0, config.heartbeat.1));
-        if conn.send(connected).await.is_err() {
-            return;
-        }
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let handle = ConnHandle { id, tx, in_flight: Arc::new(AtomicUsize::new(0)) };
-        let mut session = Session {
+        let session = Session {
             handle,
-            broker: broker.clone(),
+            broker,
             transactions: HashMap::default(),
             throttle: None,
             subs: HashMap::default(),
             messages: 0,
             batch: Vec::new(),
         };
+        (session, rx)
+    }
+
+    async fn run(stream: TcpStream, broker: Arc<Broker>, config: Arc<ServerConfig>) {
+        let mut conn: Conn = Framed::new(
+            Activity::new(stream),
+            StompCodec::with_limits(config.limits),
+        );
+        let (hb_out, hb_in) = match accept_connect(&mut conn, &config).await {
+            Ok(Some(heartbeats)) => heartbeats,
+            Ok(None) => return,
+            Err(fatal) => return close_with_error(conn, fatal).await,
+        };
+        let id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
+        if conn.send(connected_frame(id, &config)).await.is_err() {
+            return;
+        }
+        let (mut session, mut rx) = Session::new(id, broker.clone());
 
         // --- frame loop ---
         let mut hb = Heartbeats::new(hb_out, hb_in, conn.get_ref().last.clone());
@@ -783,45 +893,13 @@ impl Session {
             let frame = match next {
                 Some(Ok(Item::Frame(frame))) => Some(frame),
                 Some(Ok(Item::Heartbeat)) => None,
-                Some(Err(e)) => {
-                    self.flush_batch();
-                    return Some(Err(Fatal::new(e.to_string())));
-                }
-                None => {
-                    self.flush_batch();
-                    return Some(Ok(()));
-                }
+                Some(Err(e)) => return Some(self.end(Err(Fatal::new(e.to_string())))),
+                None => return Some(self.end(Ok(()))),
             };
-            if let Some(frame) = frame {
-                let receipt = frame.header("receipt").map(str::to_string);
-                match self.handle(frame) {
-                    Ok(flow) => {
-                        let close = matches!(flow, Flow::Close);
-                        if receipt.is_some() || close {
-                            // Deliveries caused by this or earlier frames go out first.
-                            if self.write_pending(conn, rx, hb).await.is_err() {
-                                return Some(Ok(()));
-                            }
-                        }
-                        if let Some(r) = receipt {
-                            let rf = Frame::new(Command::Receipt).with_header("receipt-id", r);
-                            if conn.send(rf).await.is_err() {
-                                return Some(Ok(()));
-                            }
-                            hb.wrote();
-                        }
-                        if close {
-                            return Some(Ok(()));
-                        }
-                    }
-                    Err(mut fatal) => {
-                        self.flush_batch();
-                        if let Some(r) = receipt {
-                            fatal.extra.push((Str::from_static("receipt-id"), r.into()));
-                        }
-                        return Some(Err(fatal));
-                    }
-                }
+            if let Some(frame) = frame
+                && let Some(outcome) = self.on_frame(frame, conn, rx, hb).await
+            {
+                return Some(outcome);
             }
             handled += 1;
             if handled >= BURST || self.throttle.is_some() {
@@ -836,6 +914,45 @@ impl Session {
             return Some(Ok(()));
         }
         None
+    }
+
+    /// Handles one frame, then writes its RECEIPT if it asked for one.
+    /// Returns `Some(outcome)` when the connection should end.
+    async fn on_frame(
+        &mut self,
+        frame: Frame,
+        conn: &mut Conn,
+        rx: &mut mpsc::UnboundedReceiver<Delivery>,
+        hb: &mut Heartbeats,
+    ) -> Option<Result<(), Fatal>> {
+        let receipt = frame.header_value("receipt").cloned();
+        let close = match self.handle(frame) {
+            Ok(flow) => matches!(flow, Flow::Close),
+            Err(mut fatal) => {
+                if let Some(r) = receipt {
+                    fatal.extra.push((Str::from_static("receipt-id"), r));
+                }
+                return Some(self.end(Err(fatal)));
+            }
+        };
+        // Deliveries caused by this or earlier frames go out first.
+        if (receipt.is_some() || close) && self.write_pending(conn, rx, hb).await.is_err() {
+            return Some(Ok(()));
+        }
+        if let Some(r) = receipt {
+            let rf = Frame::new(Command::Receipt).with_header("receipt-id", r);
+            if conn.send(rf).await.is_err() {
+                return Some(Ok(()));
+            }
+            hb.wrote();
+        }
+        close.then_some(Ok(()))
+    }
+
+    /// Ends the connection: SENDs read before the end still take effect.
+    fn end(&mut self, outcome: Result<(), Fatal>) -> Result<(), Fatal> {
+        self.flush_batch();
+        outcome
     }
 
     /// Applies batched SENDs, then writes every delivery queued so far.
@@ -870,75 +987,103 @@ impl Session {
             self.flush_batch();
         }
         if !frame.body.is_empty() && !frame.command.allows_body() {
-            return Err(Fatal::new(format!("{} frames must not have a body", frame.command.as_str())));
+            let command = frame.command.as_str();
+            return Err(Fatal::new(format!("{command} frames must not have a body")));
         }
-        match frame.command {
-            Command::Send => {
-                required(&frame, "destination")?;
-                let destination = frame.header_value("destination").unwrap().clone();
-                let tx = frame.header("transaction").map(str::to_string);
-                self.messages += 1;
-                let msg = StoredMessage::from_send((self.handle.id, self.messages), destination, frame);
-                self.submit(tx, Op::Send(Arc::new(msg)))?;
-            }
-            Command::Subscribe => {
-                let destination = required(&frame, "destination")?;
-                let id = required(&frame, "id")?;
-                let ack = match frame.header("ack").unwrap_or("auto") {
-                    "auto" => AckMode::Auto,
-                    "client" => AckMode::Client,
-                    "client-individual" => AckMode::ClientIndividual,
-                    other => return Err(Fatal::new(format!("invalid ack mode '{other}'"))),
-                };
-                if self.subs.contains_key(id) {
-                    return Err(Fatal::new(format!("subscription id '{id}' already in use")));
-                }
-                let shard = self.broker.shard_of(destination);
-                self.broker.subscribe(&self.handle, shard, id, destination, ack);
-                self.subs.insert(id.to_string(), shard);
-            }
-            Command::Unsubscribe => {
-                let id = required(&frame, "id")?;
-                let shard = self
-                    .subs
-                    .remove(id)
-                    .ok_or_else(|| Fatal::new(format!("no subscription with id '{id}'")))?;
-                self.broker.unsubscribe(self.handle.id, shard, id);
-            }
-            Command::Ack | Command::Nack => {
-                let ack_id = required(&frame, "id")?;
-                let outstanding = parse_ack_id(ack_id, self.broker.shards.len())
-                    .filter(|&(shard, seq)| self.broker.is_outstanding(self.handle.id, shard, seq));
-                let Some((shard, seq)) = outstanding else {
-                    return Err(Fatal::new(format!("no outstanding message with ack id '{ack_id}'")));
-                };
-                let tx = frame.header("transaction").map(str::to_string);
-                let op = if frame.command == Command::Ack { Op::Ack(shard, seq) } else { Op::Nack(shard, seq) };
-                self.submit(tx, op)?;
-            }
-            Command::Begin => {
-                let tx = required(&frame, "transaction")?;
-                if self.transactions.contains_key(tx) {
-                    return Err(Fatal::new(format!("transaction '{tx}' already in progress")));
-                }
-                self.transactions.insert(tx.to_string(), Vec::new());
-            }
-            Command::Commit => {
-                let tx = required(&frame, "transaction")?;
-                let ops = self.take_tx(tx)?;
-                self.throttle = self.broker.apply(self.handle.id, ops).or(self.throttle.take());
-            }
-            Command::Abort => {
-                let tx = required(&frame, "transaction")?;
-                self.take_tx(tx)?;
-            }
+        let handled = match frame.command {
+            Command::Send => self.on_send(frame),
+            Command::Subscribe => self.on_subscribe(&frame),
+            Command::Unsubscribe => self.on_unsubscribe(&frame),
+            Command::Ack | Command::Nack => self.on_ack(&frame),
+            Command::Begin => self.on_begin(&frame),
+            Command::Commit => self.on_commit(&frame),
+            Command::Abort => self.on_abort(&frame),
             Command::Disconnect => return Ok(Flow::Close),
-            Command::Connect | Command::Stomp => return Err(Fatal::new("already connected")),
+            Command::Connect | Command::Stomp => Err(Fatal::new("already connected")),
             ref other => {
-                return Err(Fatal::new(format!("unsupported command '{}'", other.as_str())));
+                let command = other.as_str();
+                Err(Fatal::new(format!("unsupported command '{command}'")))
             }
+        };
+        handled.map(|()| Flow::Continue)
+    }
+
+    fn on_commit(&mut self, frame: &Frame) -> Result<(), Fatal> {
+        let ops = self.take_tx(required(frame, "transaction")?)?;
+        let throttle = self.broker.apply(self.handle.id, ops);
+        self.throttle = throttle.or(self.throttle.take());
+        Ok(())
+    }
+
+    fn on_abort(&mut self, frame: &Frame) -> Result<(), Fatal> {
+        self.take_tx(required(frame, "transaction")?).map(drop)
+    }
+
+    fn on_send(&mut self, frame: Frame) -> Result<(), Fatal> {
+        required(&frame, "destination")?;
+        let destination = frame.header_value("destination").unwrap().clone();
+        let tx = frame.header("transaction").map(str::to_string);
+        self.messages += 1;
+        let msg = StoredMessage::from_send((self.handle.id, self.messages), destination, frame);
+        self.submit(tx, Op::Send(Arc::new(msg)))
+    }
+
+    fn on_subscribe(&mut self, frame: &Frame) -> Result<(), Fatal> {
+        let destination = required(frame, "destination")?;
+        let id = required(frame, "id")?;
+        let ack = match frame.header("ack").unwrap_or("auto") {
+            "auto" => AckMode::Auto,
+            "client" => AckMode::Client,
+            "client-individual" => AckMode::ClientIndividual,
+            other => return Err(Fatal::new(format!("invalid ack mode '{other}'"))),
+        };
+        if self.subs.contains_key(id) {
+            return Err(Fatal::new(format!("subscription id '{id}' already in use")));
         }
-        Ok(Flow::Continue)
+        let shard = self.broker.shard_of(destination);
+        self.broker
+            .subscribe(&self.handle, shard, id, destination, ack);
+        self.subs.insert(id.to_string(), shard);
+        Ok(())
+    }
+
+    fn on_unsubscribe(&mut self, frame: &Frame) -> Result<(), Fatal> {
+        let id = required(frame, "id")?;
+        let shard = self
+            .subs
+            .remove(id)
+            .ok_or_else(|| Fatal::new(format!("no subscription with id '{id}'")))?;
+        self.broker.unsubscribe(self.handle.id, shard, id);
+        Ok(())
+    }
+
+    /// ACK or NACK.
+    fn on_ack(&mut self, frame: &Frame) -> Result<(), Fatal> {
+        let ack_id = required(frame, "id")?;
+        let outstanding = parse_ack_id(ack_id, self.broker.shards.len())
+            .filter(|&(shard, seq)| self.broker.is_outstanding(self.handle.id, shard, seq));
+        let Some((shard, seq)) = outstanding else {
+            return Err(Fatal::new(format!(
+                "no outstanding message with ack id '{ack_id}'"
+            )));
+        };
+        let op = if frame.command == Command::Ack {
+            Op::Ack(shard, seq)
+        } else {
+            Op::Nack(shard, seq)
+        };
+        self.submit(frame.header("transaction").map(str::to_string), op)
+    }
+
+    fn on_begin(&mut self, frame: &Frame) -> Result<(), Fatal> {
+        let tx = required(frame, "transaction")?;
+        if self.transactions.contains_key(tx) {
+            return Err(Fatal::new(format!(
+                "transaction '{tx}' already in progress"
+            )));
+        }
+        self.transactions.insert(tx.to_string(), Vec::new());
+        Ok(())
     }
 
     fn submit(&mut self, tx: Option<String>, op: Op) -> Result<(), Fatal> {
@@ -969,18 +1114,50 @@ impl Session {
     /// Counts frames written to the socket and tells the broker when a
     /// connection that was at its in-flight limit has room again.
     fn written(&self, n: usize) {
-        if n > 0 && self.handle.in_flight.fetch_sub(n, Ordering::Relaxed) >= self.broker.flow.max_in_flight {
+        if n > 0
+            && self.handle.in_flight.fetch_sub(n, Ordering::Relaxed)
+                >= self.broker.flow.max_in_flight
+        {
             self.broker.resume(self.handle.id, self.shards());
         }
     }
 
     fn take_tx(&mut self, tx: &str) -> Result<Vec<Op>, Fatal> {
-        self.transactions.remove(tx).ok_or_else(|| Fatal::new(format!("unknown transaction '{tx}'")))
+        self.transactions
+            .remove(tx)
+            .ok_or_else(|| Fatal::new(format!("unknown transaction '{tx}'")))
     }
 }
 
+type Heartbeating = (Option<Duration>, Option<Duration>);
+
+/// Reads and validates the CONNECT frame. Returns the negotiated
+/// (outgoing, incoming) heart-beats, or `None` if the peer went away.
+async fn accept_connect(
+    conn: &mut Conn,
+    config: &ServerConfig,
+) -> Result<Option<Heartbeating>, Fatal> {
+    loop {
+        match conn.next().await {
+            None => return Ok(None),
+            Some(Ok(Item::Heartbeat)) => {}
+            Some(Ok(Item::Frame(f))) => return handshake(&f, config).map(Some),
+            Some(Err(e)) => return Err(Fatal::new(e.to_string())),
+        }
+    }
+}
+
+fn connected_frame(id: ConnId, config: &ServerConfig) -> Frame {
+    let (sx, sy) = config.heartbeat;
+    Frame::new(Command::Connected)
+        .with_header("version", "1.2")
+        .with_header("session", format!("session-{id}"))
+        .with_header("server", SERVER_NAME)
+        .with_header("heart-beat", format!("{sx},{sy}"))
+}
+
 /// Validates CONNECT/STOMP; returns negotiated (outgoing, incoming) heart-beats.
-fn handshake(f: &Frame, config: &ServerConfig) -> Result<(Option<Duration>, Option<Duration>), Fatal> {
+fn handshake(f: &Frame, config: &ServerConfig) -> Result<Heartbeating, Fatal> {
     if !matches!(f.command, Command::Connect | Command::Stomp) {
         return Err(Fatal::new("expected CONNECT or STOMP frame"));
     }
@@ -994,15 +1171,19 @@ fn handshake(f: &Frame, config: &ServerConfig) -> Result<(Option<Duration>, Opti
         let supported = SUPPORTED_VERSIONS.join(",");
         return Err(Fatal::new("unsupported protocol version")
             .header("version", &supported)
-            .detail(format!("Supported protocol versions are {}", SUPPORTED_VERSIONS.join(" "))));
+            .detail(format!(
+                "Supported protocol versions are {}",
+                SUPPORTED_VERSIONS.join(" ")
+            )));
     }
     if f.header("host").is_none() {
         return Err(Fatal::new("missing required header 'host'"));
     }
     if let Some((login, passcode)) = &config.credentials
-        && (f.header("login") != Some(login) || f.header("passcode") != Some(passcode)) {
-            return Err(Fatal::new("authentication failed"));
-        }
+        && (f.header("login") != Some(login) || f.header("passcode") != Some(passcode))
+    {
+        return Err(Fatal::new("authentication failed"));
+    }
     let (cx, cy) = parse_heartbeat(f.header("heart-beat"))
         .ok_or_else(|| Fatal::new("invalid heart-beat header"))?;
     let (sx, sy) = config.heartbeat;
@@ -1012,7 +1193,10 @@ fn handshake(f: &Frame, config: &ServerConfig) -> Result<(Option<Duration>, Opti
 /// Writes the frames already queued for this connection (plus anything
 /// previously fed) with a single flush per batch. Returns how many it took
 /// from the queue.
-async fn flush_queued(conn: &mut Conn, rx: &mut mpsc::UnboundedReceiver<Delivery>) -> Result<usize, CodecError> {
+async fn flush_queued(
+    conn: &mut Conn,
+    rx: &mut mpsc::UnboundedReceiver<Delivery>,
+) -> Result<usize, CodecError> {
     const BATCH: usize = 256;
     let mut total = 0;
     loop {
@@ -1046,7 +1230,9 @@ async fn close_with_error(mut conn: Conn, fatal: Fatal) {
     let mut frame = Frame::new(Command::Error).with_header("message", fatal.message);
     frame.headers.extend(fatal.extra);
     if let Some(detail) = fatal.detail {
-        frame = frame.with_header("content-type", "text/plain").with_body(detail);
+        frame = frame
+            .with_header("content-type", "text/plain")
+            .with_body(detail);
     }
     let _ = conn.send(frame).await;
     linger_close(conn).await;

@@ -1,6 +1,6 @@
 //! tokio-util codec for the STOMP 1.2 wire format.
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::frame::{Command, Frame, Str};
@@ -20,7 +20,11 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_frame_size: 16 * 1024 * 1024, max_headers: 1000, max_header_length: 64 * 1024 }
+        Limits {
+            max_frame_size: 16 * 1024 * 1024,
+            max_headers: 1000,
+            max_header_length: 64 * 1024,
+        }
     }
 }
 
@@ -56,10 +60,12 @@ pub struct StompCodec {
 }
 
 impl StompCodec {
+    #[must_use]
     pub fn new() -> StompCodec {
         StompCodec::default()
     }
 
+    #[must_use]
     pub fn with_limits(limits: Limits) -> StompCodec {
         StompCodec { limits }
     }
@@ -70,137 +76,191 @@ impl Decoder for StompCodec {
     type Error = CodecError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Item>, CodecError> {
-        // An EOL outside a frame is a heart-beat (this also covers the
-        // optional EOLs that may follow a frame's NULL octet).
-        match src.first() {
-            None => return Ok(None),
-            Some(b'\n') => {
-                src.advance(1);
-                return Ok(Some(Item::Heartbeat));
-            }
-            Some(b'\r') => {
-                return match src.get(1) {
-                    None => Ok(None),
-                    Some(b'\n') => {
-                        src.advance(2);
-                        Ok(Some(Item::Heartbeat))
-                    }
-                    Some(_) => Err(CodecError::MalformedHeader("bare carriage return".into())),
-                };
-            }
-            Some(_) => {}
+        if let Some(eol) = decode_eol(src) {
+            return eol;
         }
-
-        let limits = self.limits;
-
-        // Pass 1, without allocating: find the blank line ending the headers,
-        // enforce limits, check header syntax and note content-length.
-        let mut pos = 0;
-        let mut header_lines = 0usize;
-        let mut content_length = None;
-        let body_start = loop {
-            let Some(nl) = memchr(b'\n', &src[pos..]) else {
-                let partial = src.len() - pos;
-                if pos > 0 && partial > limits.max_header_length {
-                    return Err(CodecError::HeaderTooLong);
-                }
-                if src.len() > limits.max_frame_size {
-                    return Err(CodecError::FrameTooLarge);
-                }
-                return Ok(None);
-            };
-            let line = trim_cr(&src[pos..pos + nl]);
-            let first = pos == 0;
-            pos += nl + 1;
-            if line.is_empty() {
-                break pos;
-            }
-            if pos > limits.max_frame_size {
-                return Err(CodecError::FrameTooLarge);
-            }
-            if first {
-                continue;
-            }
-            header_lines += 1;
-            if line.len() > limits.max_header_length {
-                return Err(CodecError::HeaderTooLong);
-            }
-            if header_lines > limits.max_headers {
-                return Err(CodecError::TooManyHeaders);
-            }
-            if line.contains(&b'\r') {
-                return Err(CodecError::MalformedHeader("bare carriage return".into()));
-            }
-            let Some(colon) = memchr(b':', line) else {
-                return Err(CodecError::MalformedHeader(String::from_utf8_lossy(line).into()));
-            };
-            if colon == 0 {
-                return Err(CodecError::MalformedHeader("empty header name".into()));
-            }
-            // The first content-length wins, like every repeated header.
-            if content_length.is_none() && &line[..colon] == b"content-length" {
-                content_length = Some(parse_content_length(&line[colon + 1..])?);
-            }
+        let limits = &self.limits;
+        let Some(head) = scan_head(src, limits)? else {
+            return Ok(None);
         };
-
-        // Validating the whole header block once also covers every header:
-        // slicing UTF-8 at ASCII bytes (EOL, ':') leaves valid UTF-8.
-        let head = std::str::from_utf8(&src[..body_start]).map_err(|_| CodecError::InvalidUtf8)?;
-        let command_line = head.split('\n').next().unwrap_or_default();
-        let command = Command::parse(command_line.strip_suffix('\r').unwrap_or(command_line));
-
-        let body_end = match content_length {
-            Some(len) => {
-                let end = body_start.checked_add(len).ok_or(CodecError::FrameTooLarge)?;
-                if end + 1 > limits.max_frame_size {
-                    return Err(CodecError::FrameTooLarge);
-                }
-                if src.len() < end + 1 {
-                    return Ok(None);
-                }
-                if src[end] != 0 {
-                    return Err(CodecError::MissingNull);
-                }
-                end
-            }
-            None => match memchr(0, &src[body_start..]) {
-                Some(i) => body_start + i,
-                None => {
-                    if src.len() > limits.max_frame_size {
-                        return Err(CodecError::FrameTooLarge);
-                    }
-                    return Ok(None);
-                }
-            },
+        let command = parse_command(&src[..head.body_start])?;
+        let Some(body_end) = find_body_end(src, &head, limits)? else {
+            return Ok(None);
         };
-        if body_end + 1 > limits.max_frame_size {
+        // The frame is complete: take it out of the buffer as one shared
+        // allocation and hand out headers and body as slices of it.
+        let raw = src.split_to(body_end + 1).freeze();
+        let headers = slice_headers(&raw, &head, command.escapes_headers())?;
+        let body = raw.slice(head.body_start..body_end);
+        Ok(Some(Item::Frame(Frame {
+            command,
+            headers,
+            body,
+        })))
+    }
+}
+
+/// An EOL outside a frame is a heart-beat (this also covers the optional
+/// EOLs that may follow a frame's NULL octet). Returns `None` if `src`
+/// starts with a frame instead.
+fn decode_eol(src: &mut BytesMut) -> Option<Result<Option<Item>, CodecError>> {
+    let len = match (src.first(), src.get(1)) {
+        (None, _) | (Some(b'\r'), None) => return Some(Ok(None)),
+        (Some(b'\n'), _) => 1,
+        (Some(b'\r'), Some(b'\n')) => 2,
+        (Some(b'\r'), Some(_)) => {
+            return Some(Err(CodecError::MalformedHeader(
+                "bare carriage return".into(),
+            )));
+        }
+        _ => return None,
+    };
+    src.advance(len);
+    Some(Ok(Some(Item::Heartbeat)))
+}
+
+/// What a scan of the command and header lines found.
+#[derive(Default)]
+struct Head {
+    /// Offset just past the blank line that ends the headers.
+    body_start: usize,
+    header_lines: usize,
+    content_length: Option<usize>,
+}
+
+/// Finds the end of the headers without allocating, enforcing limits and
+/// header syntax on the way. `None` if the headers are not complete yet.
+fn scan_head(src: &[u8], limits: &Limits) -> Result<Option<Head>, CodecError> {
+    let mut head = Head::default();
+    let mut pos = 0;
+    loop {
+        let Some(nl) = memchr(b'\n', &src[pos..]) else {
+            return incomplete_head(src, pos, limits);
+        };
+        let line = trim_cr(&src[pos..pos + nl]);
+        let first = pos == 0;
+        pos += nl + 1;
+        if line.is_empty() {
+            head.body_start = pos;
+            return Ok(Some(head));
+        }
+        if pos > limits.max_frame_size {
             return Err(CodecError::FrameTooLarge);
         }
-
-        // Pass 2: the frame is complete. Take it out of the buffer as one
-        // shared allocation and hand out headers as slices of it.
-        let raw = src.split_to(body_end + 1).freeze();
-        let escaped = command.escapes_headers();
-        let mut headers = Vec::with_capacity(header_lines);
-        let mut pos = memchr(b'\n', &raw).unwrap() + 1;
-        for _ in 0..header_lines {
-            let nl = pos + memchr(b'\n', &raw[pos..body_start]).unwrap();
-            let end = if raw[nl - 1] == b'\r' { nl - 1 } else { nl };
-            let colon = pos + memchr(b':', &raw[pos..end]).unwrap();
-            let field = |from: usize, to: usize| -> Result<Str, CodecError> {
-                let bytes = &raw[from..to];
-                if escaped && bytes.contains(&b'\\') {
-                    unescape(bytes).map(Str::from)
-                } else {
-                    // SAFETY: inside the UTF-8 checked header block, cut at ASCII.
-                    Ok(unsafe { Str::from_utf8_unchecked(raw.slice(from..to)) })
-                }
-            };
-            headers.push((field(pos, colon)?, field(colon + 1, end)?));
-            pos = nl + 1;
+        if !first {
+            head.header_line(line, limits)?;
         }
-        let body = raw.slice(body_start..body_end);
-        Ok(Some(Item::Frame(Frame { command, headers, body })))
+    }
+}
+
+/// Headers still arriving: fine unless a limit is already exceeded.
+fn incomplete_head(
+    src: &[u8],
+    line_start: usize,
+    limits: &Limits,
+) -> Result<Option<Head>, CodecError> {
+    if line_start > 0 && src.len() - line_start > limits.max_header_length {
+        Err(CodecError::HeaderTooLong)
+    } else if src.len() > limits.max_frame_size {
+        Err(CodecError::FrameTooLarge)
+    } else {
+        Ok(None)
+    }
+}
+
+impl Head {
+    /// Checks one header line (EOL already removed).
+    fn header_line(&mut self, line: &[u8], limits: &Limits) -> Result<(), CodecError> {
+        self.header_lines += 1;
+        if line.len() > limits.max_header_length {
+            return Err(CodecError::HeaderTooLong);
+        }
+        if self.header_lines > limits.max_headers {
+            return Err(CodecError::TooManyHeaders);
+        }
+        if line.contains(&b'\r') {
+            return Err(CodecError::MalformedHeader("bare carriage return".into()));
+        }
+        let colon = match memchr(b':', line) {
+            Some(0) => return Err(CodecError::MalformedHeader("empty header name".into())),
+            Some(colon) => colon,
+            None => {
+                let line = String::from_utf8_lossy(line).into();
+                return Err(CodecError::MalformedHeader(line));
+            }
+        };
+        // The first content-length wins, like every repeated header.
+        if self.content_length.is_none() && &line[..colon] == b"content-length" {
+            self.content_length = Some(parse_content_length(&line[colon + 1..])?);
+        }
+        Ok(())
+    }
+}
+
+/// Checks the header block is UTF-8 and parses the command line. Checking
+/// the whole block once also covers every header: slicing UTF-8 at ASCII
+/// bytes (EOL, ':') leaves valid UTF-8.
+fn parse_command(head: &[u8]) -> Result<Command, CodecError> {
+    let head = utf8(head)?;
+    let line = head.split('\n').next().unwrap_or_default();
+    Ok(Command::parse(line.strip_suffix('\r').unwrap_or(line)))
+}
+
+/// Locates the body's terminating NULL. `None` if the body is incomplete.
+fn find_body_end(src: &[u8], head: &Head, limits: &Limits) -> Result<Option<usize>, CodecError> {
+    let end = match head.content_length {
+        Some(len) => {
+            let end = head
+                .body_start
+                .checked_add(len)
+                .ok_or(CodecError::FrameTooLarge)?;
+            if end + 1 > limits.max_frame_size {
+                return Err(CodecError::FrameTooLarge);
+            }
+            match src.get(end) {
+                None => return Ok(None),
+                Some(0) => end,
+                Some(_) => return Err(CodecError::MissingNull),
+            }
+        }
+        None => match memchr(0, &src[head.body_start..]) {
+            Some(i) => head.body_start + i,
+            None if src.len() > limits.max_frame_size => return Err(CodecError::FrameTooLarge),
+            None => return Ok(None),
+        },
+    };
+    if end + 1 > limits.max_frame_size {
+        return Err(CodecError::FrameTooLarge);
+    }
+    Ok(Some(end))
+}
+
+/// Builds the header list from a complete frame already checked by
+/// `scan_head` and `parse_command`.
+fn slice_headers(raw: &Bytes, head: &Head, escaped: bool) -> Result<Vec<(Str, Str)>, CodecError> {
+    let mut headers = Vec::with_capacity(head.header_lines);
+    let mut pos = memchr(b'\n', raw).expect("command line") + 1;
+    for _ in 0..head.header_lines {
+        let nl = pos + memchr(b'\n', &raw[pos..head.body_start]).expect("header line");
+        let end = if raw[nl - 1] == b'\r' { nl - 1 } else { nl };
+        let colon = pos + memchr(b':', &raw[pos..end]).expect("checked by scan_head");
+        headers.push((
+            header_field(raw, pos, colon, escaped)?,
+            header_field(raw, colon + 1, end, escaped)?,
+        ));
+        pos = nl + 1;
+    }
+    Ok(headers)
+}
+
+/// A header name or value: a slice of the frame unless it must be unescaped.
+fn header_field(raw: &Bytes, from: usize, to: usize, escaped: bool) -> Result<Str, CodecError> {
+    let bytes = &raw[from..to];
+    if escaped && bytes.contains(&b'\\') {
+        unescape(bytes).map(Str::from)
+    } else {
+        // SAFETY: inside the UTF-8 checked header block, cut at ASCII bytes.
+        Ok(unsafe { Str::from_utf8_unchecked(raw.slice(from..to)) })
     }
 }
 
@@ -266,6 +326,31 @@ pub(crate) fn escape_into(s: &str, dst: &mut BytesMut) {
     }
 }
 
+/// CONNECT/CONNECTED headers cannot be escaped, so they must not contain
+/// characters that would need it.
+fn check_unescaped(headers: &[(Str, Str)]) -> Result<(), CodecError> {
+    match headers
+        .iter()
+        .find(|(k, v)| k.contains(['\r', '\n', ':']) || v.contains(['\r', '\n']))
+    {
+        Some((k, _)) => Err(CodecError::UnencodableHeader(k.to_string())),
+        None => Ok(()),
+    }
+}
+
+fn put_header(dst: &mut BytesMut, name: &str, value: &str, escaped: bool) {
+    if escaped {
+        escape_into(name, dst);
+        dst.put_u8(b':');
+        escape_into(value, dst);
+    } else {
+        dst.put_slice(name.as_bytes());
+        dst.put_u8(b':');
+        dst.put_slice(value.as_bytes());
+    }
+    dst.put_u8(b'\n');
+}
+
 impl Encoder<Frame> for StompCodec {
     type Error = CodecError;
 
@@ -275,31 +360,23 @@ impl Encoder<Frame> for StompCodec {
         }
         let escaped = frame.command.escapes_headers();
         if !escaped {
-            for (k, v) in &frame.headers {
-                if k.contains(['\r', '\n', ':']) || v.contains(['\r', '\n']) {
-                    return Err(CodecError::UnencodableHeader(k.to_string()));
-                }
-            }
+            check_unescaped(&frame.headers)?;
         }
-
-        let headers_len: usize = frame.headers.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+        let headers_len: usize = frame
+            .headers
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 2)
+            .sum();
         dst.reserve(frame.command.as_str().len() + headers_len + frame.body.len() + 40);
         dst.put_slice(frame.command.as_str().as_bytes());
         dst.put_u8(b'\n');
+        // We always write the correct content-length ourselves.
         for (k, v) in frame.headers.iter().filter(|(k, _)| k != "content-length") {
-            if escaped {
-                escape_into(k, dst);
-                dst.put_u8(b':');
-                escape_into(v, dst);
-            } else {
-                dst.put_slice(k.as_bytes());
-                dst.put_u8(b':');
-                dst.put_slice(v.as_bytes());
-            }
-            dst.put_u8(b'\n');
+            put_header(dst, k, v, escaped);
         }
         if !frame.body.is_empty() {
-            dst.put_slice(format!("content-length:{}\n", frame.body.len()).as_bytes());
+            use std::fmt::Write;
+            let _ = writeln!(dst, "content-length:{}", frame.body.len());
         }
         dst.put_u8(b'\n');
         dst.put_slice(&frame.body);

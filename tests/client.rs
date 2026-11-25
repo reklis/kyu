@@ -7,7 +7,7 @@ mod common;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::{start_default_server, Conn, WAIT};
+use common::{Conn, WAIT, start_default_server};
 use kyu::client::{AckMode, Client, ConnectOptions, Error, OutgoingMessage};
 use kyu::codec::Item;
 use kyu::frame::{Command, Frame};
@@ -57,7 +57,8 @@ async fn connected_pair(extra: &[(&str, &str)], options: ConnectOptions) -> (Cli
 }
 
 fn reply_receipt(f: &Frame) -> Frame {
-    Frame::new(Command::Receipt).with_header("receipt-id", f.header("receipt").expect("receipt header"))
+    Frame::new(Command::Receipt)
+        .with_header("receipt-id", f.header("receipt").expect("receipt header"))
 }
 
 // ---------------------------------------------------------------------------
@@ -67,7 +68,11 @@ fn reply_receipt(f: &Frame) -> Frame {
 #[tokio::test]
 async fn connect_sends_required_headers() {
     let (_client, _conn, connect) = connected_pair(&[], opts()).await;
-    assert_eq!(connect.command, Command::Connect, "1.2 clients SHOULD use CONNECT");
+    assert_eq!(
+        connect.command,
+        Command::Connect,
+        "1.2 clients SHOULD use CONNECT"
+    );
     assert_eq!(connect.header("accept-version"), Some("1.2"));
     assert_eq!(connect.header("host"), Some("example.org"));
     assert_eq!(connect.header("login"), None);
@@ -96,7 +101,11 @@ async fn connect_can_use_stomp_command() {
 #[tokio::test]
 async fn connected_details_are_exposed() {
     let (client, _conn, _) = connected_pair(
-        &[("session", "s-1"), ("server", "fake/1.0 test"), ("heart-beat", "0,0")],
+        &[
+            ("session", "s-1"),
+            ("server", "fake/1.0 test"),
+            ("heart-beat", "0,0"),
+        ],
         opts(),
     )
     .await;
@@ -113,9 +122,14 @@ async fn connect_fails_with_server_error() {
     let fake = async {
         let mut c = server.accept().await;
         c.recv().await;
-        c.send(Frame::new(Command::Error).with_header("message", "go away").with_body("details")).await;
+        c.send(
+            Frame::new(Command::Error)
+                .with_header("message", "go away")
+                .with_body("details"),
+        )
+        .await;
     };
-    let (res, _) = tokio::join!(Client::connect(addr, opts()), fake);
+    let (res, ()) = tokio::join!(Client::connect(addr, opts()), fake);
     match res {
         Err(Error::Server { message, .. }) => assert_eq!(message.as_deref(), Some("go away")),
         other => panic!("expected server error, got {:?}", other.map(|_| ())),
@@ -128,9 +142,10 @@ async fn connect_fails_on_unsupported_version() {
     let fake = async {
         let mut c = server.accept().await;
         c.recv().await;
-        c.send(Frame::new(Command::Connected).with_header("version", "1.1")).await;
+        c.send(Frame::new(Command::Connected).with_header("version", "1.1"))
+            .await;
     };
-    let (res, _) = tokio::join!(Client::connect(addr, opts()), fake);
+    let (res, ()) = tokio::join!(Client::connect(addr, opts()), fake);
     assert!(matches!(res, Err(Error::UnsupportedVersion(v)) if v == "1.1"));
 }
 
@@ -141,7 +156,7 @@ async fn connect_fails_when_server_closes() {
         let mut c = server.accept().await;
         c.recv().await;
     };
-    let (res, _) = tokio::join!(Client::connect(addr, opts()), fake);
+    let (res, ()) = tokio::join!(Client::connect(addr, opts()), fake);
     assert!(matches!(res, Err(Error::ConnectionClosed)));
 }
 
@@ -180,7 +195,10 @@ async fn send_confirmed_waits_for_receipt() {
         conn
     };
     let start = std::time::Instant::now();
-    let (res, _conn) = tokio::join!(client.send_confirmed(OutgoingMessage::new("/q").body("x")), fake);
+    let (res, _conn) = tokio::join!(
+        client.send_confirmed(OutgoingMessage::new("/q").body("x")),
+        fake
+    );
     res.unwrap();
     assert!(start.elapsed() >= Duration::from_millis(100));
 }
@@ -233,7 +251,11 @@ async fn subscribe_sends_id_destination_and_ack() {
     assert_eq!(f.header("id"), Some(s1.id()));
     assert_eq!(g.header("ack"), Some("auto"));
     assert_eq!(g.header("id"), Some(s2.id()));
-    assert_ne!(s1.id(), s2.id(), "subscription ids must be unique per connection");
+    assert_ne!(
+        s1.id(),
+        s2.id(),
+        "subscription ids must be unique per connection"
+    );
 }
 
 #[tokio::test]
@@ -243,9 +265,7 @@ async fn ack_mode_header_values() {
     assert_eq!(AckMode::ClientIndividual.as_str(), "client-individual");
 }
 
-async fn subscribed(
-    ack: AckMode,
-) -> (Client, Conn, kyu::client::Subscription) {
+async fn subscribed(ack: AckMode) -> (Client, Conn, kyu::client::Subscription) {
     let (client, mut conn, _) = connected_pair(&[], opts()).await;
     let fake = async {
         let f = conn.expect_command(Command::Subscribe).await;
@@ -314,7 +334,8 @@ async fn unsubscribe_sends_matching_id() {
 #[tokio::test]
 async fn ack_uses_message_ack_header_as_id() {
     let (client, mut conn, mut sub) = subscribed(AckMode::ClientIndividual).await;
-    conn.send(message(sub.id(), "m1", "x").with_header("ack", "ack-77")).await;
+    conn.send(message(sub.id(), "m1", "x").with_header("ack", "ack-77"))
+        .await;
     let m = timeout(WAIT, sub.recv()).await.unwrap().unwrap();
     client.ack(&m).await.unwrap();
     let f = conn.expect_command(Command::Ack).await;
@@ -342,26 +363,30 @@ async fn acking_a_message_without_ack_header_is_an_error() {
 #[tokio::test]
 async fn transaction_binds_frames_and_commits() {
     let (client, mut conn, mut sub) = subscribed(AckMode::Client).await;
-    conn.send(message(sub.id(), "m1", "x").with_header("ack", "a1")).await;
+    conn.send(message(sub.id(), "m1", "x").with_header("ack", "a1"))
+        .await;
     let m = timeout(WAIT, sub.recv()).await.unwrap().unwrap();
 
     let fake = async {
-        let b = conn.expect_command(Command::Begin).await;
-        let tx = b.header("transaction").expect("transaction header").to_string();
-        let s = conn.expect_command(Command::Send).await;
-        assert_eq!(s.header("transaction"), Some(tx.as_str()));
-        let a = conn.expect_command(Command::Ack).await;
-        assert_eq!(a.header("transaction"), Some(tx.as_str()));
-        let n = conn.expect_command(Command::Nack).await;
-        assert_eq!(n.header("transaction"), Some(tx.as_str()));
-        let c = conn.expect_command(Command::Commit).await;
-        assert_eq!(c.header("transaction"), Some(tx.as_str()));
-        conn.send(reply_receipt(&c)).await;
+        let begin = conn.expect_command(Command::Begin).await;
+        let tx = begin
+            .header("transaction")
+            .expect("transaction header")
+            .to_string();
+        for command in [Command::Send, Command::Ack, Command::Nack] {
+            let f = conn.expect_command(command).await;
+            assert_eq!(f.header("transaction"), Some(tx.as_str()));
+        }
+        let commit = conn.expect_command(Command::Commit).await;
+        assert_eq!(commit.header("transaction"), Some(tx.as_str()));
+        conn.send(reply_receipt(&commit)).await;
         tx
     };
     let work = async {
         let tx = client.begin().await.unwrap();
-        tx.send(OutgoingMessage::new("/q").body("in tx")).await.unwrap();
+        tx.send(OutgoingMessage::new("/q").body("in tx"))
+            .await
+            .unwrap();
         tx.ack(&m).await.unwrap();
         tx.nack(&m).await.unwrap();
         tx.commit().await.unwrap();
@@ -396,12 +421,15 @@ async fn disconnect_sends_receipt_waits_and_closes() {
     let (client, mut conn, _) = connected_pair(&[], opts()).await;
     let fake = async {
         let f = conn.expect_command(Command::Disconnect).await;
-        assert!(f.header("receipt").is_some(), "graceful DISCONNECT SHOULD request a receipt");
+        assert!(
+            f.header("receipt").is_some(),
+            "graceful DISCONNECT SHOULD request a receipt"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         conn.send(reply_receipt(&f)).await;
         conn.expect_closed().await;
     };
-    let (res, _) = tokio::join!(client.disconnect(), fake);
+    let (res, ()) = tokio::join!(client.disconnect(), fake);
     res.unwrap();
 }
 
@@ -412,7 +440,7 @@ async fn disconnect_does_not_hang_if_server_closes_without_receipt() {
         conn.expect_command(Command::Disconnect).await;
         drop(conn);
     };
-    let (res, _) = tokio::join!(timeout(WAIT, client.disconnect()), fake);
+    let (res, ()) = tokio::join!(timeout(WAIT, client.disconnect()), fake);
     assert!(res.is_ok(), "disconnect hung");
 }
 
@@ -448,7 +476,9 @@ async fn client_detects_silent_server() {
     // server promises heart-beats every 50ms but sends nothing
     let (client, _conn, _) =
         connected_pair(&[("heart-beat", "50,0")], opts().heartbeat(0, 50)).await;
-    let reason = timeout(Duration::from_secs(1), client.closed()).await.expect("not detected");
+    let reason = timeout(Duration::from_secs(1), client.closed())
+        .await
+        .expect("not detected");
     assert!(matches!(reason, Error::HeartbeatTimeout));
 }
 
@@ -463,7 +493,7 @@ async fn server_heartbeats_keep_client_alive() {
         }
     };
     let res = tokio::select! {
-        _ = beats => None,
+        () = beats => None,
         r = client.closed() => Some(r),
     };
     assert!(res.is_none(), "client gave up despite heart-beats: {res:?}");
@@ -485,7 +515,7 @@ async fn server_error_fails_pending_receipts_and_closes() {
         )
         .await;
     };
-    let (res, _) = tokio::join!(client.send_confirmed(OutgoingMessage::new("/q")), fake);
+    let (res, ()) = tokio::join!(client.send_confirmed(OutgoingMessage::new("/q")), fake);
     assert!(matches!(res, Err(Error::Server { message: Some(m), .. }) if m == "bad send"));
     assert!(matches!(client.closed().await, Error::Server { .. }));
     assert!(client.send(OutgoingMessage::new("/q")).await.is_err());
@@ -507,9 +537,17 @@ async fn end_to_end_publish_subscribe() {
     let addr = start_default_server().await;
     let consumer = Client::connect(addr, opts()).await.unwrap();
     let producer = Client::connect(addr, opts()).await.unwrap();
-    let mut sub = consumer.subscribe("/topic/e2e", AckMode::Auto).await.unwrap();
+    let mut sub = consumer
+        .subscribe("/topic/e2e", AckMode::Auto)
+        .await
+        .unwrap();
     producer
-        .send_confirmed(OutgoingMessage::new("/topic/e2e").content_type("text/plain").header("k", "v").body("hi"))
+        .send_confirmed(
+            OutgoingMessage::new("/topic/e2e")
+                .content_type("text/plain")
+                .header("k", "v")
+                .body("hi"),
+        )
         .await
         .unwrap();
     let m = timeout(WAIT, sub.recv()).await.unwrap().unwrap();
@@ -524,11 +562,20 @@ async fn end_to_end_publish_subscribe() {
 async fn end_to_end_transactions_and_acks() {
     let addr = start_default_server().await;
     let c = Client::connect(addr, opts()).await.unwrap();
-    let mut sub = c.subscribe("/queue/e2e-tx", AckMode::ClientIndividual).await.unwrap();
+    let mut sub = c
+        .subscribe("/queue/e2e-tx", AckMode::ClientIndividual)
+        .await
+        .unwrap();
 
     let tx = c.begin().await.unwrap();
-    tx.send(OutgoingMessage::new("/queue/e2e-tx").body("one")).await.unwrap();
-    assert!(timeout(Duration::from_millis(150), sub.recv()).await.is_err());
+    tx.send(OutgoingMessage::new("/queue/e2e-tx").body("one"))
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(150), sub.recv())
+            .await
+            .is_err()
+    );
     tx.commit().await.unwrap();
 
     let m = timeout(WAIT, sub.recv()).await.unwrap().unwrap();
@@ -540,7 +587,11 @@ async fn end_to_end_transactions_and_acks() {
     // acked, so nothing is redelivered
     let c = Client::connect(addr, opts()).await.unwrap();
     let mut sub = c.subscribe("/queue/e2e-tx", AckMode::Auto).await.unwrap();
-    assert!(timeout(Duration::from_millis(150), sub.recv()).await.is_err());
+    assert!(
+        timeout(Duration::from_millis(150), sub.recv())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -550,11 +601,18 @@ async fn end_to_end_heartbeats() {
         ..Default::default()
     })
     .await;
-    let c = Client::connect(addr, opts().heartbeat(30, 30)).await.unwrap();
+    let c = Client::connect(addr, opts().heartbeat(30, 30))
+        .await
+        .unwrap();
     assert_eq!(c.connected().heartbeat, (30, 30));
     let res = timeout(Duration::from_millis(400), c.closed()).await;
-    assert!(res.is_err(), "connection died despite heart-beating: {res:?}");
-    c.send_confirmed(OutgoingMessage::new("/queue/hb").body("x")).await.unwrap();
+    assert!(
+        res.is_err(),
+        "connection died despite heart-beating: {res:?}"
+    );
+    c.send_confirmed(OutgoingMessage::new("/queue/hb").body("x"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -562,9 +620,14 @@ async fn end_to_end_server_error_surfaces() {
     let addr = start_default_server().await;
     let c = Client::connect(addr, opts()).await.unwrap();
     // ACK of an unknown id is an error per this server
-    let res = c.send_frame(Frame::new(Command::Ack).with_header("id", "nope")).await;
+    let res = c
+        .send_frame(Frame::new(Command::Ack).with_header("id", "nope"))
+        .await;
     assert!(res.is_ok());
-    assert!(matches!(timeout(WAIT, c.closed()).await.unwrap(), Error::Server { .. }));
+    assert!(matches!(
+        timeout(WAIT, c.closed()).await.unwrap(),
+        Error::Server { .. }
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -582,12 +645,19 @@ async fn bounded_subscription_buffer_does_not_wedge_the_client() {
     let (sub, mut conn) = tokio::join!(client.subscribe("/queue/foo", AckMode::Auto), fake);
     let mut sub = sub.unwrap();
     for i in 0..50 {
-        conn.send(message(sub.id(), &i.to_string(), &i.to_string())).await;
+        conn.send(message(sub.id(), &i.to_string(), &i.to_string()))
+            .await;
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // the application is not reading, yet the client can still write
-    timeout(WAIT, client.send(OutgoingMessage::new("/q").body("still works"))).await.unwrap().unwrap();
+    timeout(
+        WAIT,
+        client.send(OutgoingMessage::new("/q").body("still works")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let f = conn.expect_command(Command::Send).await;
     assert_eq!(&f.body[..], b"still works");
 
@@ -599,8 +669,11 @@ async fn bounded_subscription_buffer_does_not_wedge_the_client() {
 
 #[tokio::test]
 async fn stalled_subscription_does_not_trip_heartbeat_timeout() {
-    let (client, mut conn, _) =
-        connected_pair(&[("heart-beat", "50,0")], opts().heartbeat(0, 50).subscription_buffer(1)).await;
+    let (client, mut conn, _) = connected_pair(
+        &[("heart-beat", "50,0")],
+        opts().heartbeat(0, 50).subscription_buffer(1),
+    )
+    .await;
     let fake = async {
         let f = conn.expect_command(Command::Subscribe).await;
         conn.send(reply_receipt(&f)).await;
@@ -616,7 +689,12 @@ async fn stalled_subscription_does_not_trip_heartbeat_timeout() {
         tokio::time::sleep(Duration::from_millis(40)).await;
         conn.send_heartbeat().await;
     }
-    assert!(timeout(Duration::from_millis(10), client.closed()).await.is_err(), "client gave up");
+    assert!(
+        timeout(Duration::from_millis(10), client.closed())
+            .await
+            .is_err(),
+        "client gave up"
+    );
     for _ in 0..5 {
         assert!(timeout(WAIT, sub.recv()).await.unwrap().is_some());
     }
@@ -641,6 +719,9 @@ async fn full_subscription_buffer_pushes_back_on_the_server() {
         }
     })
     .await;
-    assert!(flood.is_err(), "client buffered everything instead of pushing back");
+    assert!(
+        flood.is_err(),
+        "client buffered everything instead of pushing back"
+    );
     drop(sub);
 }
