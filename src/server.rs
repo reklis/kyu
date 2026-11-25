@@ -9,23 +9,28 @@
 //!   ends (UNSUBSCRIBE, DISCONNECT or connection failure);
 //! * NACKed messages are discarded.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use bytes::{BufMut, Bytes, BytesMut};
+use futures::{FutureExt, SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpSocket, TcpStream, ToSocketAddrs};
 use tokio::sync::{Notify, mpsc};
-use tokio_util::codec::Framed;
+use tokio_util::codec::{Encoder, Framed};
 
-use crate::codec::{CodecError, Item, Limits, StompCodec};
+use crate::codec::{CodecError, Item, Limits, StompCodec, escape_into};
 use crate::frame::{Command, Frame};
 use crate::transport::{Activity, Heartbeats, Tick, negotiate, parse_heartbeat};
+
+/// Hash maps keyed by client-chosen strings (destinations, subscription
+/// ids): foldhash is several times faster than SipHash and still randomly
+/// seeded per process, so clients cannot precompute colliding keys.
+type HashMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
 
 pub const SUPPORTED_VERSIONS: &[&str] = &["1.2"];
 const SERVER_NAME: &str = concat!("kyu/", env!("CARGO_PKG_VERSION"));
@@ -140,29 +145,95 @@ enum AckMode {
     ClientIndividual,
 }
 
-#[derive(Debug, Clone)]
+/// A published message. Everything a MESSAGE frame carries apart from the
+/// per-subscription `subscription` and `ack` headers is encoded once, at
+/// SEND time, and shared by every delivery.
 struct StoredMessage {
-    id: String,
     destination: String,
-    /// User-defined headers carried by the message.
-    headers: Vec<(String, String)>,
+    /// Encoded `message-id`, `destination`, user headers, `content-length`
+    /// and the blank line that ends the headers.
+    head: Bytes,
     body: Bytes,
+}
+
+type Msg = Arc<StoredMessage>;
+
+impl StoredMessage {
+    /// Encodes a SEND frame's headers for delivery. Server headers come
+    /// first, so a producer cannot override them (the first value wins).
+    fn from_send(id: (ConnId, u64), destination: &str, frame: Frame) -> StoredMessage {
+        use std::fmt::Write;
+        let user = |k: &str| !matches!(k, "destination" | "transaction" | "receipt" | "content-length");
+        let len: usize = frame.headers.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+        let mut head = BytesMut::with_capacity(len + destination.len() + 64);
+        let _ = write!(head, "message-id:{}-{}\ndestination:", id.0, id.1);
+        escape_into(destination, &mut head);
+        head.put_u8(b'\n');
+        for (k, v) in frame.headers.iter().filter(|(k, _)| user(k)) {
+            escape_into(k, &mut head);
+            head.put_u8(b':');
+            escape_into(v, &mut head);
+            head.put_u8(b'\n');
+        }
+        if !frame.body.is_empty() {
+            let _ = writeln!(head, "content-length:{}", frame.body.len());
+        }
+        head.put_u8(b'\n');
+        StoredMessage { destination: destination.to_string(), head: head.freeze(), body: frame.body }
+    }
+}
+
+/// One MESSAGE frame on its way to a connection's writer: a few reference
+/// count bumps, no copying.
+pub(crate) struct Delivery {
+    /// The subscription's encoded "MESSAGE\nsubscription:<id>\n".
+    prefix: Bytes,
+    /// (shard, sequence) for the `ack` header, if the subscription needs one.
+    ack: Option<(usize, u64)>,
+    msg: Msg,
+}
+
+impl Encoder<Delivery> for StompCodec {
+    type Error = CodecError;
+
+    fn encode(&mut self, d: Delivery, dst: &mut BytesMut) -> Result<(), CodecError> {
+        use std::fmt::Write;
+        dst.reserve(d.prefix.len() + d.msg.head.len() + d.msg.body.len() + 48);
+        dst.put_slice(&d.prefix);
+        if let Some((shard, seq)) = d.ack {
+            let _ = writeln!(dst, "ack:{shard}-{seq}");
+        }
+        dst.put_slice(&d.msg.head);
+        dst.put_slice(&d.msg.body);
+        dst.put_u8(0);
+        Ok(())
+    }
 }
 
 struct SubState {
     destination: String,
     ack: AckMode,
+    /// Encoded first lines of every MESSAGE for this subscription.
+    prefix: Bytes,
     /// Delivered but not yet acknowledged, keyed by delivery sequence.
-    unacked: BTreeMap<u64, StoredMessage>,
+    unacked: BTreeMap<u64, Msg>,
     /// Topic messages waiting for this subscriber to have room (bounded).
-    backlog: VecDeque<StoredMessage>,
+    backlog: VecDeque<Msg>,
+}
+
+fn message_prefix(sub_id: &str) -> Bytes {
+    let mut b = BytesMut::with_capacity(sub_id.len() + 24);
+    b.put_slice(b"MESSAGE\nsubscription:");
+    escape_into(sub_id, &mut b);
+    b.put_u8(b'\n');
+    b.freeze()
 }
 
 /// What a session hands the broker so shards can deliver to it.
 #[derive(Clone)]
 struct ConnHandle {
     id: ConnId,
-    tx: mpsc::UnboundedSender<Frame>,
+    tx: mpsc::UnboundedSender<Delivery>,
     /// MESSAGE frames handed to the session but not yet written to the socket.
     in_flight: Arc<AtomicUsize>,
 }
@@ -179,7 +250,7 @@ struct ConnShard {
 struct Destination {
     subscribers: Vec<(ConnId, String)>,
     next: usize,
-    pending: VecDeque<StoredMessage>,
+    pending: VecDeque<Msg>,
     /// Signalled when a full queue drains enough for producers to continue.
     space: Arc<Notify>,
     throttling: bool,
@@ -220,7 +291,7 @@ struct Throttle {
 }
 
 enum Op {
-    Send(StoredMessage),
+    Send(Msg),
     /// (shard, delivery sequence) of the message being settled.
     Ack(usize, u64),
     Nack(usize, u64),
@@ -283,21 +354,41 @@ impl Broker {
         }
     }
 
-    /// Applies a batch of operations atomically, locking every shard involved
-    /// (in index order). Returns a throttle if a queue sent to is now full.
-    fn apply(&self, conn: ConnId, ops: Vec<Op>) -> Option<Throttle> {
-        let shard_of = |op: &Op| match op {
-            Op::Send(m) => self.shard_of(&m.destination),
-            Op::Ack(s, _) | Op::Nack(s, _) => *s,
-        };
+    /// Applies operations in order, without atomicity: consecutive operations
+    /// on the same shard share one lock acquisition.
+    fn apply_batch(&self, conn: ConnId, ops: Vec<Op>) -> Option<Throttle> {
         let mut throttle = None;
-        let mut run = |sh: &mut Shard, op: Op| match op {
-            Op::Send(msg) => {
-                if let Some(t) = sh.publish(&self.flow, msg) {
+        let mut ops = ops.into_iter().map(|op| (self.op_shard(&op), op)).peekable();
+        while let Some((shard, op)) = ops.next() {
+            let mut sh = self.lock(shard);
+            if let Some(t) = sh.run(&self.flow, conn, op) {
+                throttle = Some(t);
+            }
+            while let Some((_, op)) = ops.next_if(|(s, _)| *s == shard) {
+                if let Some(t) = sh.run(&self.flow, conn, op) {
                     throttle = Some(t);
                 }
             }
-            Op::Ack(_, seq) | Op::Nack(_, seq) => sh.settle(&self.flow, conn, seq),
+        }
+        throttle
+    }
+
+    fn op_shard(&self, op: &Op) -> usize {
+        match op {
+            Op::Send(m) => self.shard_of(&m.destination),
+            Op::Ack(s, _) | Op::Nack(s, _) => *s,
+        }
+    }
+
+    /// Applies a batch of operations atomically, locking every shard involved
+    /// (in index order). Returns a throttle if a queue sent to is now full.
+    fn apply(&self, conn: ConnId, ops: Vec<Op>) -> Option<Throttle> {
+        let shard_of = |op: &Op| self.op_shard(op);
+        let mut throttle = None;
+        let mut run = |sh: &mut Shard, op: Op| {
+            if let Some(t) = sh.run(&self.flow, conn, op) {
+                throttle = Some(t);
+            }
         };
         if ops.len() == 1 {
             let op = ops.into_iter().next().unwrap();
@@ -348,17 +439,28 @@ fn can_take(flow: &FlowLimits, c: &ConnShard, sub: &SubState) -> bool {
 }
 
 impl Shard {
+    fn run(&mut self, flow: &FlowLimits, conn: ConnId, op: Op) -> Option<Throttle> {
+        match op {
+            Op::Send(msg) => self.publish(flow, msg),
+            Op::Ack(_, seq) | Op::Nack(_, seq) => {
+                self.settle(flow, conn, seq);
+                None
+            }
+        }
+    }
+
     fn subscribe(&mut self, flow: &FlowLimits, conn: &ConnHandle, id: &str, destination: &str, ack: AckMode) {
         let c = self.conns.entry(conn.id).or_insert_with(|| ConnShard {
             handle: conn.clone(),
-            subs: HashMap::new(),
-            ack_index: HashMap::new(),
+            subs: HashMap::default(),
+            ack_index: HashMap::default(),
         });
         c.subs.insert(
             id.to_string(),
             SubState {
                 destination: destination.to_string(),
                 ack,
+                prefix: message_prefix(id),
                 unacked: BTreeMap::new(),
                 backlog: VecDeque::new(),
             },
@@ -387,39 +489,32 @@ impl Shard {
         self.dispatch(flow, &sub.destination);
     }
 
-    fn publish(&mut self, flow: &FlowLimits, msg: StoredMessage) -> Option<Throttle> {
-        let dest_name = msg.destination.clone();
-        let dest = self.destinations.entry(dest_name.clone()).or_default();
-        if is_topic(&dest_name) {
-            let subs = dest.subscribers.clone();
-            for (conn, sub) in subs {
-                self.offer_topic(flow, conn, &sub, msg.clone());
+    fn publish(&mut self, flow: &FlowLimits, msg: Msg) -> Option<Throttle> {
+        if is_topic(&msg.destination) {
+            let Shard { index, conns, destinations, seq } = self;
+            if let Some(dest) = destinations.get(&msg.destination) {
+                for (conn, sub_id) in &dest.subscribers {
+                    if let Some(c) = conns.get_mut(conn) {
+                        offer_topic(flow, *index, seq, c, sub_id, &msg);
+                    }
+                }
             }
             None
         } else {
+            let held = msg.clone();
+            let name = held.destination.as_str();
+            let dest = match self.destinations.get_mut(name) {
+                Some(d) => d,
+                None => self.destinations.entry(name.to_string()).or_default(),
+            };
             dest.pending.push_back(msg);
-            self.dispatch(flow, &dest_name);
-            let dest = self.destinations.get_mut(&dest_name).unwrap();
+            self.dispatch(flow, name);
+            let dest = self.destinations.get_mut(name).unwrap();
             if dest.pending.len() >= flow.max_queue_depth {
                 dest.throttling = true;
-                return Some(Throttle { destination: dest_name, space: dest.space.clone() });
+                return Some(Throttle { destination: name.to_string(), space: dest.space.clone() });
             }
             None
-        }
-    }
-
-    fn offer_topic(&mut self, flow: &FlowLimits, conn: ConnId, sub_id: &str, msg: StoredMessage) {
-        let (index, seq) = (self.index, &mut self.seq);
-        let Some(c) = self.conns.get_mut(&conn) else { return };
-        let Some(sub) = c.subs.get(sub_id) else { return };
-        if sub.backlog.is_empty() && can_take(flow, c, sub) {
-            deliver(index, seq, c, sub_id, msg);
-        } else if flow.topic_backlog > 0 {
-            let sub = c.subs.get_mut(sub_id).unwrap();
-            if sub.backlog.len() >= flow.topic_backlog {
-                sub.backlog.pop_front();
-            }
-            sub.backlog.push_back(msg);
         }
     }
 
@@ -495,22 +590,32 @@ impl Shard {
     }
 }
 
-fn deliver(shard: usize, seq: &mut u64, c: &mut ConnShard, sub_id: &str, msg: StoredMessage) {
+/// Delivers a topic message now, or buffers it if the subscriber is busy.
+fn offer_topic(flow: &FlowLimits, shard: usize, seq: &mut u64, c: &mut ConnShard, sub_id: &str, msg: &Msg) {
+    let Some(sub) = c.subs.get(sub_id) else { return };
+    if sub.backlog.is_empty() && can_take(flow, c, sub) {
+        deliver(shard, seq, c, sub_id, msg.clone());
+    } else if flow.topic_backlog > 0 {
+        let sub = c.subs.get_mut(sub_id).unwrap();
+        if sub.backlog.len() >= flow.topic_backlog {
+            sub.backlog.pop_front();
+        }
+        sub.backlog.push_back(msg.clone());
+    }
+}
+
+fn deliver(shard: usize, seq: &mut u64, c: &mut ConnShard, sub_id: &str, msg: Msg) {
     let Some(sub) = c.subs.get_mut(sub_id) else { return };
-    let mut frame = Frame::new(Command::Message)
-        .with_header("subscription", sub_id)
-        .with_header("message-id", msg.id.clone())
-        .with_header("destination", msg.destination.clone());
-    if sub.ack != AckMode::Auto {
+    let ack = if sub.ack == AckMode::Auto {
+        None
+    } else {
         *seq += 1;
-        frame = frame.with_header("ack", format!("{shard}-{seq}"));
         sub.unacked.insert(*seq, msg.clone());
         c.ack_index.insert(*seq, sub_id.to_string());
-    }
-    frame.headers.extend(msg.headers);
-    frame.body = msg.body;
+        Some((shard, *seq))
+    };
     c.handle.in_flight.fetch_add(1, Ordering::Relaxed);
-    let _ = c.handle.tx.send(frame);
+    let _ = c.handle.tx.send(Delivery { prefix: sub.prefix.clone(), ack, msg });
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +666,8 @@ struct Session {
     transactions: HashMap<String, Vec<Op>>,
     /// Set while a queue this connection sent to is full.
     throttle: Option<Throttle>,
+    /// Non-transactional SENDs read but not yet applied (see `burst`).
+    batch: Vec<Op>,
 }
 
 enum Flow {
@@ -604,10 +711,11 @@ impl Session {
         let mut session = Session {
             handle,
             broker: broker.clone(),
-            transactions: HashMap::new(),
+            transactions: HashMap::default(),
             throttle: None,
-            subs: HashMap::new(),
+            subs: HashMap::default(),
             messages: 0,
+            batch: Vec::new(),
         };
 
         // --- frame loop ---
@@ -621,37 +729,11 @@ impl Session {
                         session.throttle = None;
                     }
                 }
-                item = conn.next(), if session.throttle.is_none() => match item {
-                    Some(Ok(Item::Heartbeat)) => {}
-                    Some(Ok(Item::Frame(frame))) => {
-                        let receipt = frame.header("receipt").map(str::to_string);
-                        match session.handle(frame) {
-                            Ok(flow) => {
-                                // Deliveries caused by this or earlier frames go out first.
-                                match flush_queued(&mut conn, &mut rx).await {
-                                    Ok(n) => session.written(n),
-                                    Err(_) => break Ok(()),
-                                }
-                                if let Some(r) = receipt {
-                                    let rf = Frame::new(Command::Receipt).with_header("receipt-id", r);
-                                    if conn.send(rf).await.is_err() { break Ok(()); }
-                                    hb.wrote();
-                                }
-                                if let Flow::Close = flow {
-                                    break Ok(());
-                                }
-                            }
-                            Err(mut fatal) => {
-                                if let Some(r) = receipt {
-                                    fatal.extra.push(("receipt-id".into(), r));
-                                }
-                                break Err(fatal);
-                            }
-                        }
+                item = conn.next(), if session.throttle.is_none() => {
+                    if let Some(outcome) = session.burst(&mut conn, &mut rx, &mut hb, item).await {
+                        break outcome;
                     }
-                    Some(Err(e)) => break Err(Fatal::new(e.to_string())),
-                    None => break Ok(()),
-                },
+                }
                 Some(frame) = rx.recv() => {
                     if conn.feed(frame).await.is_err() { break Ok(()); }
                     match flush_queued(&mut conn, &mut rx).await {
@@ -680,7 +762,113 @@ impl Session {
         }
     }
 
+    /// Handles `first` and then every further frame already readable (up to
+    /// `BURST`). Consecutive SENDs are applied together, so a pipelining
+    /// producer takes each shard lock once per burst instead of once per
+    /// message. Everything else keeps its order: the pending SENDs are applied
+    /// before any other command, receipt, error or close.
+    ///
+    /// Returns `Some(outcome)` when the connection should end.
+    async fn burst(
+        &mut self,
+        conn: &mut Conn,
+        rx: &mut mpsc::UnboundedReceiver<Delivery>,
+        hb: &mut Heartbeats,
+        first: Option<Result<Item, CodecError>>,
+    ) -> Option<Result<(), Fatal>> {
+        const BURST: usize = 256;
+        let mut next = first;
+        let mut handled = 0;
+        loop {
+            let frame = match next {
+                Some(Ok(Item::Frame(frame))) => Some(frame),
+                Some(Ok(Item::Heartbeat)) => None,
+                Some(Err(e)) => {
+                    self.flush_batch();
+                    return Some(Err(Fatal::new(e.to_string())));
+                }
+                None => {
+                    self.flush_batch();
+                    return Some(Ok(()));
+                }
+            };
+            if let Some(frame) = frame {
+                let receipt = frame.header("receipt").map(str::to_string);
+                match self.handle(frame) {
+                    Ok(flow) => {
+                        let close = matches!(flow, Flow::Close);
+                        if receipt.is_some() || close {
+                            // Deliveries caused by this or earlier frames go out first.
+                            if self.write_pending(conn, rx, hb).await.is_err() {
+                                return Some(Ok(()));
+                            }
+                        }
+                        if let Some(r) = receipt {
+                            let rf = Frame::new(Command::Receipt).with_header("receipt-id", r);
+                            if conn.send(rf).await.is_err() {
+                                return Some(Ok(()));
+                            }
+                            hb.wrote();
+                        }
+                        if close {
+                            return Some(Ok(()));
+                        }
+                    }
+                    Err(mut fatal) => {
+                        self.flush_batch();
+                        if let Some(r) = receipt {
+                            fatal.extra.push(("receipt-id".into(), r));
+                        }
+                        return Some(Err(fatal));
+                    }
+                }
+            }
+            handled += 1;
+            if handled >= BURST || self.throttle.is_some() {
+                break;
+            }
+            match conn.next().now_or_never() {
+                Some(item) => next = item,
+                None => break,
+            }
+        }
+        if self.write_pending(conn, rx, hb).await.is_err() {
+            return Some(Ok(()));
+        }
+        None
+    }
+
+    /// Applies batched SENDs, then writes every delivery queued so far.
+    async fn write_pending(
+        &mut self,
+        conn: &mut Conn,
+        rx: &mut mpsc::UnboundedReceiver<Delivery>,
+        hb: &mut Heartbeats,
+    ) -> Result<(), CodecError> {
+        self.flush_batch();
+        let n = flush_queued(conn, rx).await?;
+        if n > 0 {
+            self.written(n);
+            hb.wrote();
+        }
+        Ok(())
+    }
+
+    fn flush_batch(&mut self) {
+        if self.batch.is_empty() {
+            return;
+        }
+        let ops = std::mem::take(&mut self.batch);
+        if let Some(t) = self.broker.apply_batch(self.handle.id, ops) {
+            self.throttle = Some(t);
+        }
+    }
+
     fn handle(&mut self, frame: Frame) -> Result<Flow, Fatal> {
+        if frame.command != Command::Send {
+            // Keep order: earlier SENDs take effect before anything else.
+            self.flush_batch();
+        }
         if !frame.body.is_empty() && !frame.command.allows_body() {
             return Err(Fatal::new(format!("{} frames must not have a body", frame.command.as_str())));
         }
@@ -688,22 +876,9 @@ impl Session {
             Command::Send => {
                 let destination = required(&frame, "destination")?.to_string();
                 let tx = frame.header("transaction").map(str::to_string);
-                let headers = frame
-                    .headers
-                    .iter()
-                    .filter(|(k, _)| {
-                        !matches!(k.as_str(), "destination" | "transaction" | "receipt" | "content-length")
-                    })
-                    .cloned()
-                    .collect();
                 self.messages += 1;
-                let msg = StoredMessage {
-                    id: format!("{}-{}", self.handle.id, self.messages),
-                    destination,
-                    headers,
-                    body: frame.body,
-                };
-                self.submit(tx, Op::Send(msg))?;
+                let msg = StoredMessage::from_send((self.handle.id, self.messages), &destination, frame);
+                self.submit(tx, Op::Send(Arc::new(msg)))?;
             }
             Command::Subscribe => {
                 let destination = required(&frame, "destination")?;
@@ -767,6 +942,7 @@ impl Session {
 
     fn submit(&mut self, tx: Option<String>, op: Op) -> Result<(), Fatal> {
         match tx {
+            None if matches!(op, Op::Send(_)) => self.batch.push(op),
             None => {
                 if let Some(t) = self.broker.apply(self.handle.id, vec![op]) {
                     self.throttle = Some(t);
@@ -835,7 +1011,7 @@ fn handshake(f: &Frame, config: &ServerConfig) -> Result<(Option<Duration>, Opti
 /// Writes the frames already queued for this connection (plus anything
 /// previously fed) with a single flush per batch. Returns how many it took
 /// from the queue.
-async fn flush_queued(conn: &mut Conn, rx: &mut mpsc::UnboundedReceiver<Frame>) -> Result<usize, CodecError> {
+async fn flush_queued(conn: &mut Conn, rx: &mut mpsc::UnboundedReceiver<Delivery>) -> Result<usize, CodecError> {
     const BATCH: usize = 256;
     let mut total = 0;
     loop {

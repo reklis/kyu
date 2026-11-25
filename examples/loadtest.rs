@@ -3,6 +3,9 @@
 //!   cargo run --release --example loadtest                 # all scenarios, in-process server
 //!   cargo run --release --example loadtest -- queue fanout # pick scenarios
 //!   cargo run --release --example loadtest -- --addr 127.0.0.1:61613
+//!   cargo run --release --example loadtest -- --addr 127.0.0.1:61613 \
+//!       --host / --login guest --passcode guest       # external broker
+//!       --server-pid PID     # measure the broker's CPU/RSS (idle, slowconsumer)
 //!
 //! Scenarios: rtt, queue, parallel, destinations, ack, fanout, idle,
 //!            slowconsumer, connections
@@ -10,7 +13,7 @@
 //! timestamp header (so producers and consumers must share a process).
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -25,12 +28,30 @@ use tokio::task::JoinSet;
 
 static RUN: AtomicU64 = AtomicU64::new(0);
 
+/// Destination names unique across runs, so state a long-lived broker kept
+/// from an earlier run (e.g. a slow-consumer backlog) cannot skew this one.
 fn unique(prefix: &str) -> String {
-    format!("{prefix}-{}", RUN.fetch_add(1, Ordering::Relaxed))
+    format!("{prefix}-{}-{}", std::process::id(), RUN.fetch_add(1, Ordering::Relaxed))
 }
 
+/// CONNECT settings for external brokers: `--host`, `--login`, `--passcode`.
+static CONNECT: OnceLock<(String, Option<(String, String)>)> = OnceLock::new();
+
 fn opts() -> ConnectOptions {
-    ConnectOptions::new("localhost")
+    let (host, creds) = CONNECT.get_or_init(|| ("localhost".into(), None));
+    let o = ConnectOptions::new(host);
+    match creds {
+        Some((l, p)) => o.credentials(l, p),
+        None => o,
+    }
+}
+
+/// Removes `--name value` from `args`, returning the value.
+fn take_flag(args: &mut Vec<String>, name: &str) -> Option<String> {
+    let i = args.iter().position(|a| a == name)?;
+    let v = args.get(i + 1).cloned().unwrap_or_else(|| panic!("{name} needs a value"));
+    args.drain(i..=i + 1);
+    Some(v)
 }
 
 #[derive(Default)]
@@ -202,9 +223,18 @@ async fn destinations(addr: SocketAddr, dests: usize, producers: usize, total: u
     );
 }
 
-/// CPU seconds (user + system) used by this process so far.
+/// Process whose CPU and memory are measured: this one (in-process server)
+/// or the broker given by `--server-pid`.
+static MEASURED: OnceLock<String> = OnceLock::new();
+
+fn proc_file(name: &str) -> String {
+    let pid = MEASURED.get().map_or("self", String::as_str);
+    std::fs::read_to_string(format!("/proc/{pid}/{name}")).unwrap_or_default()
+}
+
+/// CPU seconds (user + system) used by the measured process so far.
 fn cpu_seconds() -> f64 {
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let stat = proc_file("stat");
     let fields: Vec<&str> = stat.rsplit(')').next().unwrap_or("").split_whitespace().collect();
     let ticks: f64 = fields.get(11).and_then(|u| u.parse::<f64>().ok()).unwrap_or(0.0)
         + fields.get(12).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
@@ -212,7 +242,7 @@ fn cpu_seconds() -> f64 {
 }
 
 fn rss_mb() -> f64 {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let status = proc_file("status");
     status
         .lines()
         .find(|l| l.starts_with("VmRSS:"))
@@ -229,6 +259,11 @@ async fn idle(addr: SocketAddr, clients: usize, ms: u32, hold: Duration) {
         set.spawn(async move { Client::connect(addr, opts().heartbeat(ms, ms)).await.unwrap() });
     }
     let cs: Vec<Client> = set.join_all().await;
+    // The rate actually agreed: each direction uses the larger of the two
+    // sides' settings (servers may insist on a slower rate than we ask for).
+    let (sx, sy) = cs[0].connected().heartbeat;
+    let agreed = |server: u32| if server == 0 { "off".to_string() } else { format!("{}ms", server.max(ms)) };
+    let (send, recv) = (agreed(sx), agreed(sy));
     let cpu0 = cpu_seconds();
     tokio::time::sleep(hold).await;
     let cpu = cpu_seconds() - cpu0;
@@ -239,7 +274,7 @@ async fn idle(addr: SocketAddr, clients: usize, ms: u32, hold: Duration) {
         }
     }
     println!(
-        "  {clients:>5} idle clients @ {ms}ms heart-beats for {hold:?}: {alive} alive, {:.1}% of one core",
+        "  {clients:>5} idle clients, heart-beats asked {ms}ms, agreed server->client {send} client->server {recv}, {hold:?}: {alive} alive, {:.1}% of one core",
         100.0 * cpu / hold.as_secs_f64()
     );
     let mut set = JoinSet::new();
@@ -420,12 +455,15 @@ async fn rtt(addr: SocketAddr, rounds: usize) {
 #[tokio::main]
 async fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let addr = match args.iter().position(|a| a == "--addr") {
-        Some(i) => {
-            let a = args.remove(i + 1).parse().expect("--addr host:port");
-            args.remove(i);
-            a
-        }
+    let host = take_flag(&mut args, "--host").unwrap_or_else(|| "localhost".into());
+    let login = take_flag(&mut args, "--login");
+    let passcode = take_flag(&mut args, "--passcode");
+    CONNECT.set((host, login.map(|l| (l, passcode.unwrap_or_default())))).unwrap();
+    if let Some(pid) = take_flag(&mut args, "--server-pid") {
+        MEASURED.set(pid).unwrap();
+    }
+    let addr = match take_flag(&mut args, "--addr") {
+        Some(a) => a.parse().expect("--addr host:port"),
         None => {
             // Heart-beats only happen when a client asks for them.
             let config = ServerConfig { heartbeat: (100, 100), ..ServerConfig::default() };
@@ -494,7 +532,7 @@ async fn main() {
         }
     }
     if want("slowconsumer") {
-        println!("\n[slowconsumer] 1 KiB messages, consumer limited to 2k msg/s for 3s (in-process RSS)");
+        println!("\n[slowconsumer] 1 KiB messages, consumer limited to 2k msg/s for 3s (server RSS)");
         slow_consumer(addr, 2_000, Duration::from_secs(3), AckMode::Auto).await;
         slow_consumer(addr, 2_000, Duration::from_secs(3), AckMode::ClientIndividual).await;
     }

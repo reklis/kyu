@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use common::*;
@@ -1233,5 +1233,69 @@ async fn ack_id_for_another_shard_or_sequence_is_rejected() {
         let mut c = Conn::connect(addr).await;
         c.send(Frame::new(Command::Ack).with_header("id", bogus)).await;
         c.expect_error_and_close().await;
+    }
+}
+
+#[tokio::test]
+async fn topic_copies_carry_each_subscriptions_own_headers() {
+    let addr = start_default_server().await;
+    let mut c = Conn::connect(addr).await;
+    c.subscribe("auto-sub", "/topic/shared", "auto").await;
+    c.subscribe("acked:sub", "/topic/shared", "client-individual").await;
+    c.send(send_frame("/topic/shared", "one")).await;
+
+    let mut seen = HashMap::new();
+    for _ in 0..2 {
+        let m = c.expect_command(Command::Message).await;
+        seen.insert(m.header("subscription").unwrap().to_string(), m);
+    }
+    let auto = &seen["auto-sub"];
+    let acked = &seen["acked:sub"];
+    assert_eq!(auto.header("ack"), None);
+    assert!(acked.header("ack").is_some());
+    for m in [auto, acked] {
+        assert_eq!(m.header("destination"), Some("/topic/shared"));
+        assert_eq!(body(m), "one");
+    }
+}
+
+#[tokio::test]
+async fn producer_cannot_override_server_message_headers() {
+    let addr = start_default_server().await;
+    let mut c = Conn::connect(addr).await;
+    c.subscribe("real", "/queue/spoof", "client-individual").await;
+    c.send(
+        send_frame("/queue/spoof", "x")
+            .with_header("subscription", "fake")
+            .with_header("message-id", "fake")
+            .with_header("ack", "fake"),
+    )
+    .await;
+    let m = c.expect_command(Command::Message).await;
+    assert_eq!(m.header("subscription"), Some("real"));
+    assert_ne!(m.header("message-id"), Some("fake"));
+    let ack = m.header("ack").unwrap().to_string();
+    assert_ne!(ack, "fake");
+    c.send_with_receipt(Frame::new(Command::Ack).with_header("id", &ack), "acked").await;
+}
+
+#[tokio::test]
+async fn pipelined_sends_before_a_fatal_frame_are_still_delivered() {
+    let addr = start_default_server().await;
+    let mut sub = Conn::connect(addr).await;
+    sub.subscribe("s", "/queue/pipelined", "auto").await;
+
+    let mut publ = Conn::connect(addr).await;
+    let mut wire = Vec::new();
+    for i in 0..50 {
+        wire.extend_from_slice(format!("SEND\ndestination:/queue/pipelined\n\n{i}\0").as_bytes());
+    }
+    wire.extend_from_slice(b"SEND\n\nno destination\0");
+    publ.send_raw(&wire).await;
+    publ.expect_error_and_close().await;
+
+    for i in 0..50 {
+        let m = sub.expect_command(Command::Message).await;
+        assert_eq!(body(&m), i.to_string());
     }
 }

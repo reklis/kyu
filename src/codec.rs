@@ -233,7 +233,7 @@ fn needs_escape(b: u8) -> bool {
     matches!(b, b'\\' | b'\r' | b'\n' | b':')
 }
 
-fn escape_into(s: &str, dst: &mut BytesMut) {
+pub(crate) fn escape_into(s: &str, dst: &mut BytesMut) {
     if !s.bytes().any(needs_escape) {
         dst.put_slice(s.as_bytes());
         return;

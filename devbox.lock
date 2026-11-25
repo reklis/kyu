@@ -1,6 +1,54 @@
 {
   "lockfile_version": "1",
   "packages": {
+    "activemq@latest": {
+      "last_modified": "2026-10-02T22:55:44Z",
+      "resolved": "github:NixOS/nixpkgs/55ba7f49ef2962b42cbd126522b7df5f95037679#activemq",
+      "source": "devbox-search",
+      "version": "6.2.4",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/4jbqfzp1kqwz3cf6q6z84pjszpk2rml3-activemq-6.2.4",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/4jbqfzp1kqwz3cf6q6z84pjszpk2rml3-activemq-6.2.4"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/4zz7rl0mrwpxwc7yj8fwc8jw3ciwr9kf-activemq-6.2.4",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/4zz7rl0mrwpxwc7yj8fwc8jw3ciwr9kf-activemq-6.2.4"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/hhc45kihza1hg6i75xy3d5gxd2dhixyv-activemq-6.2.4",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/hhc45kihza1hg6i75xy3d5gxd2dhixyv-activemq-6.2.4"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/lbp18hpfa9q6w42mp4l5m6kgy1r081sj-activemq-6.2.4",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/lbp18hpfa9q6w42mp4l5m6kgy1r081sj-activemq-6.2.4"
+        }
+      }
+    },
     "github:NixOS/nixpkgs/nixpkgs-unstable": {
       "last_modified": "2026-11-02T01:28:21Z",
       "resolved": "github:NixOS/nixpkgs/5c9de89ec55bff981cb8da1a4ee92b10f1438ffc?lastModified=1793582901&narHash=sha256-WDValiY9se78X2Wh7aWWaq%2Fc7HN29U555%2BOKbHEzYrw%3D"
@@ -38,6 +86,71 @@
             }
           ],
           "store_path": "/nix/store/wvrl2jv46nfig6kmmnsbs899k3cpznyb-perf-linux-7.2.9"
+        }
+      }
+    },
+    "rabbitmq-server@latest": {
+      "last_modified": "2026-10-04T07:06:02Z",
+      "resolved": "github:NixOS/nixpkgs/a322c65bf7233456788a9ebf03bc067db7dc090a#rabbitmq-server",
+      "source": "devbox-search",
+      "version": "4.3.1",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/3yqv9syqxvmmv67s5kb29cc6pdns1w2m-rabbitmq-server-4.3.1",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/71p1vb8ay4w22rb30pfwm8rxhr93mxk1-rabbitmq-server-4.3.1-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/6fv20r64lpl8dpry5mgwgih3cfgh45z2-rabbitmq-server-4.3.1-doc"
+            }
+          ],
+          "store_path": "/nix/store/3yqv9syqxvmmv67s5kb29cc6pdns1w2m-rabbitmq-server-4.3.1"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/b4r36pvg5qr91a81zf5jgi0jr2nx4ysm-rabbitmq-server-4.3.1",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/crkh0n53fwnd8ipsiwsdfm8l2241n109-rabbitmq-server-4.3.1-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/hzm9rj3ahikj6qf5ld90z1y12q7d5mqf-rabbitmq-server-4.3.1-doc"
+            }
+          ],
+          "store_path": "/nix/store/b4r36pvg5qr91a81zf5jgi0jr2nx4ysm-rabbitmq-server-4.3.1"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/csck7hvqavqkc2pi5sigj1wqpfzs2hj3-rabbitmq-server-4.3.1",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/ln3c370m01gqwgsqk2iqwr01f8wvb1ax-rabbitmq-server-4.3.1-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/kgbsrrmvxqdrp2ljvziy50a7az6v1mql-rabbitmq-server-4.3.1-doc"
+            }
+          ],
+          "store_path": "/nix/store/csck7hvqavqkc2pi5sigj1wqpfzs2hj3-rabbitmq-server-4.3.1"
         }
       }
     }
