@@ -45,6 +45,7 @@ impl LastRead {
 pub struct Activity<S> {
     pub inner: S,
     pub last: LastRead,
+    track: bool,
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Activity<S> {
@@ -56,7 +57,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Activity<S> {
         let this = self.get_mut();
         let before = buf.filled().len();
         let res = Pin::new(&mut this.inner).poll_read(cx, buf);
-        if buf.filled().len() > before {
+        if this.track && buf.filled().len() > before {
             this.last.touch();
         }
         res
@@ -112,7 +113,15 @@ impl<S> Activity<S> {
         Activity {
             inner,
             last: LastRead::new(),
+            track: false,
         }
+    }
+
+    /// Enables read-timestamp tracking (only needed when incoming heart-beats
+    /// are negotiated).
+    pub fn track_reads(&mut self) {
+        self.track = true;
+        self.last.touch();
     }
 }
 
@@ -165,8 +174,11 @@ impl Heartbeats {
         loop {
             tokio::select! {
                 () = self.write_timer.as_mut(), if self.out.is_some() => {
-                    let due = self.last_write + self.out.unwrap();
-                    if Instant::now() >= due {
+                    let interval = self.out.unwrap();
+                    let due = self.last_write + interval;
+                    let now = Instant::now();
+                    if now >= due {
+                        self.write_timer.as_mut().reset(now + interval);
                         return Tick::SendHeartbeat;
                     }
                     self.write_timer.as_mut().reset(due);

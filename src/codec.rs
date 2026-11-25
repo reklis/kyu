@@ -57,6 +57,7 @@ pub enum CodecError {
 #[derive(Debug, Clone, Default)]
 pub struct StompCodec {
     limits: Limits,
+    pending: Option<ParsedHead>,
 }
 
 impl StompCodec {
@@ -67,8 +68,19 @@ impl StompCodec {
 
     #[must_use]
     pub fn with_limits(limits: Limits) -> StompCodec {
-        StompCodec { limits }
+        StompCodec {
+            limits,
+            pending: None,
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedHead {
+    command: Command,
+    head: Head,
+    /// Offset up to which we have already scanned for the NULL terminator.
+    scanned_to: usize,
 }
 
 impl Decoder for StompCodec {
@@ -76,24 +88,34 @@ impl Decoder for StompCodec {
     type Error = CodecError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Item>, CodecError> {
-        if let Some(eol) = decode_eol(src) {
-            return eol;
-        }
-        let limits = &self.limits;
-        let Some(head) = scan_head(src, limits)? else {
-            return Ok(None);
+        let mut parsed = if let Some(p) = self.pending.take() {
+            p
+        } else {
+            if let Some(eol) = decode_eol(src) {
+                return eol;
+            }
+            let Some(head) = scan_head(src, &self.limits)? else {
+                return Ok(None);
+            };
+            let command = parse_command(&src[..head.body_start])?;
+            let scanned_to = head.body_start;
+            ParsedHead {
+                command,
+                head,
+                scanned_to,
+            }
         };
-        let command = parse_command(&src[..head.body_start])?;
-        let Some(body_end) = find_body_end(src, &head, limits)? else {
+        let Some(body_end) = find_body_end(src, &mut parsed, &self.limits)? else {
+            self.pending = Some(parsed);
             return Ok(None);
         };
         // The frame is complete: take it out of the buffer as one shared
         // allocation and hand out headers and body as slices of it.
         let raw = src.split_to(body_end + 1).freeze();
-        let headers = slice_headers(&raw, &head, command.escapes_headers())?;
-        let body = raw.slice(head.body_start..body_end);
+        let headers = slice_headers(&raw, &parsed.head, parsed.command.escapes_headers())?;
+        let body = raw.slice(parsed.head.body_start..body_end);
         Ok(Some(Item::Frame(Frame {
-            command,
+            command: parsed.command,
             headers,
             body,
         })))
@@ -120,7 +142,7 @@ fn decode_eol(src: &mut BytesMut) -> Option<Result<Option<Item>, CodecError>> {
 }
 
 /// What a scan of the command and header lines found.
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct Head {
     /// Offset just past the blank line that ends the headers.
     body_start: usize,
@@ -178,7 +200,7 @@ impl Head {
         if self.header_lines > limits.max_headers {
             return Err(CodecError::TooManyHeaders);
         }
-        if line.contains(&b'\r') {
+        if memchr(b'\r', line).is_some() {
             return Err(CodecError::MalformedHeader("bare carriage return".into()));
         }
         let colon = match memchr(b':', line) {
@@ -207,10 +229,17 @@ fn parse_command(head: &[u8]) -> Result<Command, CodecError> {
 }
 
 /// Locates the body's terminating NULL. `None` if the body is incomplete.
-fn find_body_end(src: &[u8], head: &Head, limits: &Limits) -> Result<Option<usize>, CodecError> {
-    let end = match head.content_length {
+/// Reserves space in `src` when `content-length` is known to avoid repeated
+/// buffer reallocations while reading large frames.
+fn find_body_end(
+    src: &mut BytesMut,
+    parsed: &mut ParsedHead,
+    limits: &Limits,
+) -> Result<Option<usize>, CodecError> {
+    let end = match parsed.head.content_length {
         Some(len) => {
-            let end = head
+            let end = parsed
+                .head
                 .body_start
                 .checked_add(len)
                 .ok_or(CodecError::FrameTooLarge)?;
@@ -218,15 +247,21 @@ fn find_body_end(src: &[u8], head: &Head, limits: &Limits) -> Result<Option<usiz
                 return Err(CodecError::FrameTooLarge);
             }
             match src.get(end) {
-                None => return Ok(None),
+                None => {
+                    src.reserve(end + 1 - src.len());
+                    return Ok(None);
+                }
                 Some(0) => end,
                 Some(_) => return Err(CodecError::MissingNull),
             }
         }
-        None => match memchr(0, &src[head.body_start..]) {
-            Some(i) => head.body_start + i,
+        None => match memchr(0, &src[parsed.scanned_to..]) {
+            Some(i) => parsed.scanned_to + i,
             None if src.len() > limits.max_frame_size => return Err(CodecError::FrameTooLarge),
-            None => return Ok(None),
+            None => {
+                parsed.scanned_to = src.len();
+                return Ok(None);
+            }
         },
     };
     if end + 1 > limits.max_frame_size {
@@ -306,6 +341,25 @@ fn unescape(bytes: &[u8]) -> Result<String, CodecError> {
     String::from_utf8(out).map_err(|_| CodecError::InvalidUtf8)
 }
 
+/// Writes an unsigned integer in decimal ASCII without going through `core::fmt`.
+pub(crate) fn put_u64(dst: &mut BytesMut, mut n: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + u8::try_from(n % 10).unwrap();
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    dst.put_slice(&buf[i..]);
+}
+
+pub(crate) fn put_usize(dst: &mut BytesMut, n: usize) {
+    put_u64(dst, u64::try_from(n).unwrap_or(u64::MAX));
+}
+
 fn needs_escape(b: u8) -> bool {
     matches!(b, b'\\' | b'\r' | b'\n' | b':')
 }
@@ -375,8 +429,9 @@ impl Encoder<Frame> for StompCodec {
             put_header(dst, k, v, escaped);
         }
         if !frame.body.is_empty() {
-            use std::fmt::Write;
-            let _ = writeln!(dst, "content-length:{}", frame.body.len());
+            dst.put_slice(b"content-length:");
+            put_usize(dst, frame.body.len());
+            dst.put_u8(b'\n');
         }
         dst.put_u8(b'\n');
         dst.put_slice(&frame.body);

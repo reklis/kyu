@@ -14,13 +14,12 @@
 //! # Ok(()) }
 //! ```
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -29,6 +28,8 @@ use tokio_util::codec::Framed;
 use crate::codec::{CodecError, Item, StompCodec};
 use crate::frame::{Command, Frame, Str};
 use crate::transport::{Activity, Heartbeats, Tick, negotiate, parse_heartbeat};
+
+type HashMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
@@ -157,7 +158,8 @@ pub struct OutgoingMessage {
 impl OutgoingMessage {
     pub fn new(destination: impl Into<Str>) -> Self {
         OutgoingMessage {
-            frame: Frame::new(Command::Send).with_header("destination", destination),
+            frame: Frame::new(Command::Send)
+                .with_header(Str::from_static("destination"), destination),
         }
     }
 
@@ -170,7 +172,7 @@ impl OutgoingMessage {
 
     #[must_use]
     pub fn content_type(self, ct: impl Into<Str>) -> Self {
-        self.header("content-type", ct)
+        self.header(Str::from_static("content-type"), ct)
     }
 
     #[must_use]
@@ -243,6 +245,7 @@ enum Outgoing {
 pub struct Client {
     out: mpsc::UnboundedSender<Outgoing>,
     shared: Arc<Mutex<Shared>>,
+    is_closed: Arc<AtomicBool>,
     closed: watch::Receiver<Option<Error>>,
     connected: Connected,
     ids: AtomicU64,
@@ -340,11 +343,13 @@ impl Client {
         let (sx, sy) = connected.heartbeat;
 
         let shared = Arc::new(Mutex::new(Shared::default()));
+        let is_closed = Arc::new(AtomicBool::new(false));
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         let (closed_tx, closed_rx) = watch::channel(None);
         let io = IoTask {
             conn,
             shared: shared.clone(),
+            is_closed: is_closed.clone(),
             out: out_rx,
             hb_out: negotiate(cx, sy),
             hb_in: negotiate(sx, cy),
@@ -354,6 +359,7 @@ impl Client {
         Ok(Client {
             out: out_tx,
             shared,
+            is_closed,
             closed: closed_rx,
             connected,
             ids: AtomicU64::new(0),
@@ -375,7 +381,9 @@ impl Client {
     /// [`Error::ConnectionClosed`] (or the reason it closed) if the
     /// connection is gone, or the encoding error if the frame is invalid.
     pub async fn send_frame(&self, frame: Frame) -> Result<(), Error> {
-        if let Some(e) = lock(&self.shared).closed.clone() {
+        if self.is_closed.load(Ordering::Relaxed)
+            && let Some(e) = lock(&self.shared).closed.clone()
+        {
             return Err(e);
         }
         let (tx, rx) = oneshot::channel();
@@ -396,7 +404,7 @@ impl Client {
             }
             shared.receipts.insert(receipt.clone(), tx);
         }
-        self.send_frame(frame.with_header("receipt", receipt))
+        self.send_frame(frame.with_header(Str::from_static("receipt"), receipt))
             .await?;
         rx.await.unwrap_or(Err(Error::ConnectionClosed))
     }
@@ -427,9 +435,9 @@ impl Client {
         let (tx, rx) = mpsc::channel(self.subscription_buffer);
         lock(&self.shared).subs.insert(id.clone(), tx);
         let frame = Frame::new(Command::Subscribe)
-            .with_header("id", id.clone())
-            .with_header("destination", destination)
-            .with_header("ack", ack.as_str());
+            .with_header(Str::from_static("id"), id.clone())
+            .with_header(Str::from_static("destination"), destination)
+            .with_header(Str::from_static("ack"), Str::from_static(ack.as_str()));
         if let Err(e) = self.send_with_receipt(frame).await {
             lock(&self.shared).subs.remove(&id);
             return Err(e);
@@ -443,17 +451,20 @@ impl Client {
     /// As for [`Client::send_confirmed`].
     pub async fn unsubscribe(&self, sub: Subscription) -> Result<(), Error> {
         let res = self
-            .send_with_receipt(Frame::new(Command::Unsubscribe).with_header("id", sub.id.clone()))
+            .send_with_receipt(
+                Frame::new(Command::Unsubscribe)
+                    .with_header(Str::from_static("id"), sub.id.clone()),
+            )
             .await;
         lock(&self.shared).subs.remove(&sub.id);
         res
     }
 
     fn ack_frame(command: Command, msg: &Message, tx: Option<&str>) -> Result<Frame, Error> {
-        let id = msg.ack_id().ok_or(Error::NoAckHeader)?;
-        let mut f = Frame::new(command).with_header("id", id);
+        let id = msg.frame.header_value("ack").ok_or(Error::NoAckHeader)?;
+        let mut f = Frame::new(command).with_header(Str::from_static("id"), id.clone());
         if let Some(tx) = tx {
-            f = f.with_header("transaction", tx);
+            f = f.with_header(Str::from_static("transaction"), tx);
         }
         Ok(f)
     }
@@ -589,6 +600,7 @@ fn server_error(frame: Frame) -> Error {
 struct IoTask {
     conn: Conn,
     shared: Arc<Mutex<Shared>>,
+    is_closed: Arc<AtomicBool>,
     out: mpsc::UnboundedReceiver<Outgoing>,
     hb_out: Option<Duration>,
     hb_in: Option<Duration>,
@@ -600,6 +612,7 @@ impl IoTask {
         {
             let mut shared = lock(&self.shared);
             shared.closed = Some(reason.clone());
+            self.is_closed.store(true, Ordering::Release);
             for (_, waiter) in shared.receipts.drain() {
                 let _ = waiter.send(Err(reason.clone()));
             }
@@ -617,6 +630,9 @@ impl IoTask {
     }
 
     async fn event_loop(&mut self) -> Error {
+        if self.hb_in.is_some() {
+            self.conn.get_mut().track_reads();
+        }
         let mut hb = Heartbeats::new(self.hb_out, self.hb_in, self.conn.get_ref().last.clone());
         let mut disconnecting = false;
         // A message waiting for room in its subscription's buffer. While set,
@@ -632,68 +648,17 @@ impl IoTask {
                         permit.send(msg);
                     }
                 }
-                item = self.conn.next(), if stalled.is_none() => match item {
-                    Some(Ok(Item::Heartbeat)) => {}
-                    Some(Ok(Item::Frame(f))) => match self.incoming(f) {
+                item = self.conn.next(), if stalled.is_none() => {
+                    match self.incoming_burst(item) {
                         Incoming::Handled => {}
                         Incoming::Stall(tx, msg) => stalled = Some((tx, msg)),
                         Incoming::End(reason) => return reason,
-                    },
-                    Some(Err(e)) => return e.into(),
-                    None => return Error::ConnectionClosed,
-                },
+                    }
+                }
                 cmd = self.out.recv() => {
-                    // Write everything already queued, then flush once.
-                    let mut next = cmd;
-                    let mut waiters = Vec::new();
-                    let mut close = false;
-                    let mut failed = None;
-                    loop {
-                        match next {
-                            Some(Outgoing::Frame(frame, done)) => {
-                                // Clients MUST NOT send any more frames after DISCONNECT.
-                                if disconnecting || failed.is_some() {
-                                    let _ = done.send(Err(Error::ConnectionClosed));
-                                } else {
-                                    disconnecting = frame.command == Command::Disconnect;
-                                    match self.conn.feed(frame).await {
-                                        Ok(()) => waiters.push(done),
-                                        Err(e) => {
-                                            let e = Error::from(e);
-                                            let _ = done.send(Err(e.clone()));
-                                            failed = Some(e);
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Outgoing::Close) | None => {
-                                close = true;
-                                break;
-                            }
-                        }
-                        if waiters.len() >= 256 {
-                            break;
-                        }
-                        match self.out.try_recv() {
-                            Ok(cmd) => next = Some(cmd),
-                            Err(_) => break,
-                        }
+                    if let Some(reason) = self.write_burst(cmd, &mut disconnecting, &mut hb).await {
+                        return reason;
                     }
-                    if failed.is_none()
-                        && let Err(e) = SinkExt::<Frame>::flush(&mut self.conn).await {
-                            failed = Some(e.into());
-                        }
-                    let res = failed.clone().map_or(Ok(()), Err);
-                    for done in waiters {
-                        let _ = done.send(res.clone());
-                    }
-                    if let Some(e) = failed {
-                        return e;
-                    }
-                    if close {
-                        return Error::ConnectionClosed;
-                    }
-                    hb.wrote();
                 }
                 tick = hb.tick() => match tick {
                     Tick::SendHeartbeat => {
@@ -708,6 +673,95 @@ impl IoTask {
                 },
             }
         }
+    }
+
+    /// Handles `first` and any further frames already buffered in the codec
+    /// (up to `BURST`), avoiding per-frame `select!` overhead.
+    fn incoming_burst(&mut self, first: Option<Result<Item, CodecError>>) -> Incoming {
+        const BURST: usize = 64;
+        let mut next = first;
+        let mut handled = 0;
+        loop {
+            match next {
+                Some(Ok(Item::Heartbeat)) => {}
+                Some(Ok(Item::Frame(f))) => match self.incoming(f) {
+                    Incoming::Handled => {}
+                    other => return other,
+                },
+                Some(Err(e)) => return Incoming::End(e.into()),
+                None => return Incoming::End(Error::ConnectionClosed),
+            }
+            handled += 1;
+            if handled >= BURST {
+                return Incoming::Handled;
+            }
+            match self.conn.next().now_or_never() {
+                Some(item) => next = item,
+                None => return Incoming::Handled,
+            }
+        }
+    }
+
+    /// Writes `first` and every further outgoing command already queued, then
+    /// flushes once. Returns `Some(reason)` if the connection should end.
+    async fn write_burst(
+        &mut self,
+        first: Option<Outgoing>,
+        disconnecting: &mut bool,
+        hb: &mut Heartbeats,
+    ) -> Option<Error> {
+        let mut next = first;
+        let mut waiters = Vec::new();
+        let mut close = false;
+        let mut failed = None;
+        loop {
+            match next {
+                Some(Outgoing::Frame(frame, done)) => {
+                    // Clients MUST NOT send any more frames after DISCONNECT.
+                    if *disconnecting || failed.is_some() {
+                        let _ = done.send(Err(Error::ConnectionClosed));
+                    } else {
+                        *disconnecting = frame.command == Command::Disconnect;
+                        match self.conn.feed(frame).await {
+                            Ok(()) => waiters.push(done),
+                            Err(e) => {
+                                let e = Error::from(e);
+                                let _ = done.send(Err(e.clone()));
+                                failed = Some(e);
+                            }
+                        }
+                    }
+                }
+                Some(Outgoing::Close) | None => {
+                    close = true;
+                    break;
+                }
+            }
+            if waiters.len() >= 256 {
+                break;
+            }
+            match self.out.try_recv() {
+                Ok(cmd) => next = Some(cmd),
+                Err(_) => break,
+            }
+        }
+        if failed.is_none()
+            && let Err(e) = SinkExt::<Frame>::flush(&mut self.conn).await
+        {
+            failed = Some(e.into());
+        }
+        let res = failed.clone().map_or(Ok(()), Err);
+        for done in waiters {
+            let _ = done.send(res.clone());
+        }
+        if let Some(e) = failed {
+            return Some(e);
+        }
+        if close {
+            return Some(Error::ConnectionClosed);
+        }
+        hb.wrote();
+        None
     }
 
     /// Handles a server frame.
