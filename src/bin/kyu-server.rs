@@ -6,6 +6,10 @@
 
 use kyu::server::{Server, ServerConfig};
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:61613".into());

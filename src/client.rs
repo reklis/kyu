@@ -24,12 +24,11 @@ use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{Instant, sleep_until};
 use tokio_util::codec::Framed;
 
 use crate::codec::{CodecError, Item, StompCodec};
 use crate::frame::{Command, Frame};
-use crate::transport::{Activity, negotiate, parse_heartbeat, read_deadline};
+use crate::transport::{Activity, Heartbeats, Tick, negotiate, parse_heartbeat};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
@@ -71,6 +70,7 @@ pub struct ConnectOptions {
     passcode: Option<String>,
     heartbeat: (u32, u32),
     use_stomp_command: bool,
+    subscription_buffer: usize,
 }
 
 impl ConnectOptions {
@@ -82,6 +82,7 @@ impl ConnectOptions {
             passcode: None,
             heartbeat: (0, 0),
             use_stomp_command: false,
+            subscription_buffer: 1024,
         }
     }
 
@@ -95,6 +96,13 @@ impl ConnectOptions {
     /// and the interval at which it wants to receive them. 0 disables.
     pub fn heartbeat(mut self, cx: u32, cy: u32) -> Self {
         self.heartbeat = (cx, cy);
+        self
+    }
+
+    /// How many received messages each subscription buffers before the client
+    /// stops reading from the socket (pushing back on the server).
+    pub fn subscription_buffer(mut self, messages: usize) -> Self {
+        self.subscription_buffer = messages.max(1);
         self
     }
 
@@ -192,7 +200,7 @@ impl Message {
 
 pub struct Subscription {
     id: String,
-    rx: mpsc::UnboundedReceiver<Message>,
+    rx: mpsc::Receiver<Message>,
 }
 
 impl Subscription {
@@ -209,7 +217,7 @@ impl Subscription {
 #[derive(Default)]
 struct Shared {
     receipts: HashMap<String, oneshot::Sender<Result<(), Error>>>,
-    subs: HashMap<String, mpsc::UnboundedSender<Message>>,
+    subs: HashMap<String, mpsc::Sender<Message>>,
     closed: Option<Error>,
 }
 
@@ -224,6 +232,7 @@ pub struct Client {
     closed: watch::Receiver<Option<Error>>,
     connected: Connected,
     ids: AtomicU64,
+    subscription_buffer: usize,
 }
 
 type Conn = Framed<Activity<TcpStream>, StompCodec>;
@@ -289,7 +298,14 @@ impl Client {
         };
         tokio::spawn(io.run(closed_tx));
 
-        Ok(Client { out: out_tx, shared, closed: closed_rx, connected, ids: AtomicU64::new(0) })
+        Ok(Client {
+            out: out_tx,
+            shared,
+            closed: closed_rx,
+            connected,
+            ids: AtomicU64::new(0),
+            subscription_buffer: options.subscription_buffer,
+        })
     }
 
     pub fn connected(&self) -> &Connected {
@@ -339,7 +355,7 @@ impl Client {
     /// Subscribes and waits until the server confirms the subscription.
     pub async fn subscribe(&self, destination: &str, ack: AckMode) -> Result<Subscription, Error> {
         let id = self.next_id("sub");
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(self.subscription_buffer);
         self.shared.lock().unwrap().subs.insert(id.clone(), tx);
         let frame = Frame::new(Command::Subscribe)
             .with_header("id", id.clone())
@@ -476,21 +492,28 @@ impl IoTask {
     }
 
     async fn event_loop(&mut self) -> Error {
-        let far = Duration::from_secs(86400 * 365);
-        let last_read = self.conn.get_ref().last.clone();
-        let mut last_write = Instant::now();
+        let mut hb = Heartbeats::new(self.hb_out, self.hb_in, self.conn.get_ref().last.clone());
         let mut disconnecting = false;
+        // A message waiting for room in its subscription's buffer. While set,
+        // the socket is not read, so TCP pushes back on the server.
+        let mut stalled: Option<(mpsc::Sender<Message>, Message)> = None;
         loop {
-            let write_due = last_write + self.hb_out.unwrap_or(far);
-            let read_due = *last_read.lock().unwrap() + self.hb_in.map(read_deadline).unwrap_or(far);
             tokio::select! {
-                item = self.conn.next() => match item {
-                    Some(Ok(Item::Heartbeat)) => {}
-                    Some(Ok(Item::Frame(f))) => {
-                        if let Some(reason) = self.incoming(f) {
-                            return reason;
-                        }
+                permit = async { stalled.as_ref().unwrap().0.clone().reserve_owned().await },
+                    if stalled.is_some() =>
+                {
+                    let (_, msg) = stalled.take().unwrap();
+                    if let Ok(permit) = permit {
+                        permit.send(msg);
                     }
+                }
+                item = self.conn.next(), if stalled.is_none() => match item {
+                    Some(Ok(Item::Heartbeat)) => {}
+                    Some(Ok(Item::Frame(f))) => match self.incoming(f) {
+                        Incoming::Handled => {}
+                        Incoming::Stall(tx, msg) => stalled = Some((tx, msg)),
+                        Incoming::End(reason) => return reason,
+                    },
                     Some(Err(e)) => return e.into(),
                     None => return Error::ConnectionClosed,
                 },
@@ -545,43 +568,52 @@ impl IoTask {
                     if close {
                         return Error::ConnectionClosed;
                     }
-                    last_write = Instant::now();
+                    hb.wrote();
                 }
-                _ = sleep_until(write_due), if self.hb_out.is_some() => {
-                    if let Err(e) = self.conn.send(Item::Heartbeat).await {
-                        return e.into();
+                tick = hb.tick() => match tick {
+                    Tick::SendHeartbeat => {
+                        if let Err(e) = self.conn.send(Item::Heartbeat).await {
+                            return e.into();
+                        }
+                        hb.wrote();
                     }
-                    last_write = Instant::now();
-                }
-                _ = sleep_until(read_due), if self.hb_in.is_some() => {
-                    if last_read.lock().unwrap().elapsed() >= read_deadline(self.hb_in.unwrap()) {
-                        return Error::HeartbeatTimeout;
-                    }
-                }
+                    // Unread data may be waiting while we push back; the peer is alive.
+                    Tick::PeerDead if stalled.is_some() => hb.read_alive(),
+                    Tick::PeerDead => return Error::HeartbeatTimeout,
+                },
             }
         }
     }
 
-    /// Handles a server frame; returns Some(reason) if the connection must end.
-    fn incoming(&mut self, f: Frame) -> Option<Error> {
+    /// Handles a server frame.
+    fn incoming(&mut self, f: Frame) -> Incoming {
         match f.command {
             Command::Message => {
                 let shared = self.shared.lock().unwrap();
-                if let Some(tx) = f.header("subscription").and_then(|s| shared.subs.get(s)) {
-                    let _ = tx.send(Message { frame: f });
-                }
-                None
+                if let Some(tx) = f.header("subscription").and_then(|s| shared.subs.get(s))
+                    && let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(Message { frame: f }) {
+                        return Incoming::Stall(tx.clone(), msg);
+                    }
+                Incoming::Handled
             }
             Command::Receipt => {
                 if let Some(id) = f.header("receipt-id")
                     && let Some(waiter) = self.shared.lock().unwrap().receipts.remove(id) {
                         let _ = waiter.send(Ok(()));
                     }
-                None
+                Incoming::Handled
             }
             // The server closes the connection after an ERROR.
-            Command::Error => Some(server_error(f)),
-            other => Some(Error::Protocol(format!("unexpected {} frame from server", other.as_str()))),
+            Command::Error => Incoming::End(server_error(f)),
+            other => Incoming::End(Error::Protocol(format!("unexpected {} frame from server", other.as_str()))),
         }
     }
+}
+
+enum Incoming {
+    Handled,
+    /// The subscription's buffer is full: hold this message and stop reading.
+    Stall(mpsc::Sender<Message>, Message),
+    /// The connection must end.
+    End(Error),
 }

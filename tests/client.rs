@@ -566,3 +566,81 @@ async fn end_to_end_server_error_surfaces() {
     assert!(res.is_ok());
     assert!(matches!(timeout(WAIT, c.closed()).await.unwrap(), Error::Server { .. }));
 }
+
+// ---------------------------------------------------------------------------
+// Flow control
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bounded_subscription_buffer_does_not_wedge_the_client() {
+    let (client, mut conn, _) = connected_pair(&[], opts().subscription_buffer(4)).await;
+    let fake = async {
+        let f = conn.expect_command(Command::Subscribe).await;
+        conn.send(reply_receipt(&f)).await;
+        conn
+    };
+    let (sub, mut conn) = tokio::join!(client.subscribe("/queue/foo", AckMode::Auto), fake);
+    let mut sub = sub.unwrap();
+    for i in 0..50 {
+        conn.send(message(sub.id(), &i.to_string(), &i.to_string())).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // the application is not reading, yet the client can still write
+    timeout(WAIT, client.send(OutgoingMessage::new("/q").body("still works"))).await.unwrap().unwrap();
+    let f = conn.expect_command(Command::Send).await;
+    assert_eq!(&f.body[..], b"still works");
+
+    for i in 0..50 {
+        let m = timeout(WAIT, sub.recv()).await.unwrap().unwrap();
+        assert_eq!(m.message_id(), Some(i.to_string().as_str()));
+    }
+}
+
+#[tokio::test]
+async fn stalled_subscription_does_not_trip_heartbeat_timeout() {
+    let (client, mut conn, _) =
+        connected_pair(&[("heart-beat", "50,0")], opts().heartbeat(0, 50).subscription_buffer(1)).await;
+    let fake = async {
+        let f = conn.expect_command(Command::Subscribe).await;
+        conn.send(reply_receipt(&f)).await;
+        conn
+    };
+    let (sub, mut conn) = tokio::join!(client.subscribe("/queue/foo", AckMode::Auto), fake);
+    let mut sub = sub.unwrap();
+    for i in 0..5 {
+        conn.send(message(sub.id(), &i.to_string(), "x")).await;
+    }
+    // server keeps heart-beating; the client has unread data but is alive
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        conn.send_heartbeat().await;
+    }
+    assert!(timeout(Duration::from_millis(10), client.closed()).await.is_err(), "client gave up");
+    for _ in 0..5 {
+        assert!(timeout(WAIT, sub.recv()).await.unwrap().is_some());
+    }
+}
+
+#[tokio::test]
+async fn full_subscription_buffer_pushes_back_on_the_server() {
+    let (client, mut conn, _) = connected_pair(&[], opts().subscription_buffer(4)).await;
+    let fake = async {
+        let f = conn.expect_command(Command::Subscribe).await;
+        conn.send(reply_receipt(&f)).await;
+        conn
+    };
+    let (sub, mut conn) = tokio::join!(client.subscribe("/queue/foo", AckMode::Auto), fake);
+    let sub = sub.unwrap();
+    let big = "x".repeat(64 * 1024);
+    let id = sub.id().to_string();
+    // 20 MB of messages nobody is reading: the server's writes must stall
+    let flood = timeout(Duration::from_millis(500), async {
+        for i in 0..320 {
+            conn.send(message(&id, &i.to_string(), &big)).await;
+        }
+    })
+    .await;
+    assert!(flood.is_err(), "client buffered everything instead of pushing back");
+    drop(sub);
+}

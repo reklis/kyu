@@ -93,13 +93,14 @@ impl Decoder for StompCodec {
 
         let limits = self.limits;
 
-        // Locate the command line and header lines, up to the blank line.
-        let mut lines: Vec<&[u8]> = Vec::new();
+        // Pass 1: find the blank line ending the headers, enforcing limits,
+        // without allocating.
         let mut pos = 0;
+        let mut header_lines = 0usize;
         let body_start = loop {
             let Some(nl) = src[pos..].iter().position(|&b| b == b'\n') else {
                 let partial = src.len() - pos;
-                if !lines.is_empty() && partial > limits.max_header_length {
+                if pos > 0 && partial > limits.max_header_length {
                     return Err(CodecError::HeaderTooLong);
                 }
                 if src.len() > limits.max_frame_size {
@@ -107,32 +108,33 @@ impl Decoder for StompCodec {
                 }
                 return Ok(None);
             };
-            let mut line = &src[pos..pos + nl];
-            if let Some(stripped) = line.strip_suffix(b"\r") {
-                line = stripped;
-            }
+            let line = trim_cr(&src[pos..pos + nl]);
+            let first = pos == 0;
             pos += nl + 1;
             if line.is_empty() {
                 break pos;
             }
-            if !lines.is_empty() {
+            if !first {
+                header_lines += 1;
                 if line.len() > limits.max_header_length {
                     return Err(CodecError::HeaderTooLong);
                 }
-                if lines.len() > limits.max_headers {
+                if header_lines > limits.max_headers {
                     return Err(CodecError::TooManyHeaders);
                 }
             }
-            lines.push(line);
             if pos > limits.max_frame_size {
                 return Err(CodecError::FrameTooLarge);
             }
         };
 
-        let command = Command::parse(utf8(lines[0])?);
+        // Pass 2: parse the command and headers.
+        let head = &src[..body_start];
+        let mut lines = head.split(|&b| b == b'\n').map(trim_cr);
+        let command = Command::parse(utf8(lines.next().unwrap_or_default())?);
         let escaped = command.escapes_headers();
-        let mut headers = Vec::with_capacity(lines.len() - 1);
-        for line in &lines[1..] {
+        let mut headers = Vec::with_capacity(header_lines);
+        for line in lines.take(header_lines) {
             if line.contains(&b'\r') {
                 return Err(CodecError::MalformedHeader("bare carriage return".into()));
             }
@@ -197,11 +199,18 @@ impl Decoder for StompCodec {
     }
 }
 
+fn trim_cr(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
 fn utf8(bytes: &[u8]) -> Result<&str, CodecError> {
     std::str::from_utf8(bytes).map_err(|_| CodecError::InvalidUtf8)
 }
 
 fn unescape(bytes: &[u8]) -> Result<String, CodecError> {
+    if !bytes.contains(&b'\\') {
+        return utf8(bytes).map(str::to_owned);
+    }
     let mut out = Vec::with_capacity(bytes.len());
     let mut iter = bytes.iter();
     while let Some(&b) = iter.next() {
@@ -220,7 +229,15 @@ fn unescape(bytes: &[u8]) -> Result<String, CodecError> {
     String::from_utf8(out).map_err(|_| CodecError::InvalidUtf8)
 }
 
+fn needs_escape(b: u8) -> bool {
+    matches!(b, b'\\' | b'\r' | b'\n' | b':')
+}
+
 fn escape_into(s: &str, dst: &mut BytesMut) {
+    if !s.bytes().any(needs_escape) {
+        dst.put_slice(s.as_bytes());
+        return;
+    }
     for b in s.bytes() {
         match b {
             b'\\' => dst.put_slice(b"\\\\"),
@@ -248,6 +265,8 @@ impl Encoder<Frame> for StompCodec {
             }
         }
 
+        let headers_len: usize = frame.headers.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+        dst.reserve(frame.command.as_str().len() + headers_len + frame.body.len() + 40);
         dst.put_slice(frame.command.as_str().as_bytes());
         dst.put_u8(b'\n');
         for (k, v) in frame.headers.iter().filter(|(k, _)| k != "content-length") {

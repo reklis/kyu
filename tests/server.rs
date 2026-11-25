@@ -1031,3 +1031,207 @@ async fn accepts_a_burst_of_concurrent_connections() {
     assert_eq!(conns.len(), 3000);
     assert!(start.elapsed() < Duration::from_millis(900), "burst took {:?}", start.elapsed());
 }
+
+// ---------------------------------------------------------------------------
+// Flow control (server-specific: STOMP leaves this to implementations)
+// ---------------------------------------------------------------------------
+
+fn flow(f: impl FnOnce(&mut ServerConfig)) -> ServerConfig {
+    let mut c = ServerConfig::default();
+    f(&mut c);
+    c
+}
+
+#[tokio::test]
+async fn prefetch_limits_unacked_messages_per_subscription() {
+    let addr = start_server(flow(|c| c.prefetch = 3)).await;
+    let mut c = Conn::connect(addr).await;
+    c.subscribe("0", "/queue/pf", "client-individual").await;
+    let mut p = Conn::connect(addr).await;
+    for i in 0..10 {
+        p.publish("/queue/pf", &i.to_string()).await;
+    }
+    let ms = receive_bodies(&mut c, 3).await;
+    c.expect_nothing().await;
+
+    c.send(ack(&ms[0])).await;
+    let next = c.expect_command(Command::Message).await;
+    assert_eq!(body(&next), "3");
+    c.expect_nothing().await;
+}
+
+#[tokio::test]
+async fn cumulative_ack_frees_all_covered_credit() {
+    let addr = start_server(flow(|c| c.prefetch = 3)).await;
+    let mut c = Conn::connect(addr).await;
+    c.subscribe("0", "/queue/pfc", "client").await;
+    let mut p = Conn::connect(addr).await;
+    for i in 0..10 {
+        p.publish("/queue/pfc", &i.to_string()).await;
+    }
+    let ms = receive_bodies(&mut c, 3).await;
+    c.send(ack(&ms[2])).await;
+    let more = receive_bodies(&mut c, 3).await;
+    assert_eq!(more.iter().map(body).collect::<Vec<_>>(), vec!["3", "4", "5"]);
+    c.expect_nothing().await;
+}
+
+#[tokio::test]
+async fn busy_consumers_are_skipped() {
+    let addr = start_server(flow(|c| c.prefetch = 2)).await;
+    let mut a = Conn::connect(addr).await;
+    a.subscribe("0", "/queue/busy", "client-individual").await;
+    let mut b = Conn::connect(addr).await;
+    b.subscribe("0", "/queue/busy", "client-individual").await;
+    let mut p = Conn::connect(addr).await;
+    for i in 0..4 {
+        p.publish("/queue/busy", &i.to_string()).await;
+    }
+    // both consumers are now full; new work waits for whoever acks first
+    let a_msgs = receive_bodies(&mut a, 2).await;
+    receive_bodies(&mut b, 2).await;
+    p.publish("/queue/busy", "4").await;
+    a.expect_nothing().await;
+    b.expect_nothing().await;
+    a.send(ack(&a_msgs[0])).await;
+    assert_eq!(body(&a.expect_command(Command::Message).await), "4");
+}
+
+#[tokio::test]
+async fn queue_messages_stay_queued_while_a_consumer_is_not_reading() {
+    let addr = start_server(flow(|c| c.max_in_flight = 8)).await;
+    let mut stalled = Conn::connect(addr).await;
+    stalled.subscribe("0", "/queue/stall", "auto").await; // and then never reads
+    let mut p = Conn::connect(addr).await;
+    let big = "x".repeat(64 * 1024);
+    for _ in 0..500 {
+        p.send(send_frame("/queue/stall", &big)).await;
+    }
+    p.send_with_receipt(send_frame("/queue/stall", "last"), "done").await;
+
+    let mut fresh = Conn::connect(addr).await;
+    fresh.subscribe("0", "/queue/stall", "auto").await;
+    let mut got = 0;
+    while fresh.try_recv(QUIET).await.is_some() {
+        got += 1;
+    }
+    // only what fit in socket buffers and the in-flight window went to the stalled consumer
+    assert!(got >= 300, "fresh consumer only got {got} of 501");
+}
+
+#[tokio::test]
+async fn producers_are_throttled_while_a_queue_is_full() {
+    let addr = start_server(flow(|c| c.max_queue_depth = 100)).await;
+    let mut p = Conn::connect(addr).await;
+    for i in 0..300 {
+        p.send(send_frame("/queue/full", &i.to_string())).await;
+    }
+    p.send(send_frame("/queue/full", "end").with_header("receipt", "r")).await;
+    assert!(p.try_recv(Duration::from_millis(300)).await.is_none(), "producer was not throttled");
+
+    let mut c = Conn::connect(addr).await;
+    c.subscribe("0", "/queue/full", "auto").await;
+    let r = p.expect_command(Command::Receipt).await;
+    assert_eq!(r.header("receipt-id"), Some("r"));
+    assert_eq!(receive_bodies(&mut c, 301).await.len(), 301);
+}
+
+#[tokio::test]
+async fn throttled_producer_keeps_heartbeating() {
+    let addr = start_server(flow(|c| {
+        c.max_queue_depth = 10;
+        c.heartbeat = (50, 0);
+    }))
+    .await;
+    let mut p = Conn::open(addr).await;
+    p.send(connect_frame().with_header("heart-beat", "0,50")).await;
+    p.expect_command(Command::Connected).await;
+    for i in 0..50 {
+        p.send(send_frame("/queue/hbfull", &i.to_string())).await;
+    }
+    assert_eq!(p.next_item(Duration::from_millis(300)).await, Some(Item::Heartbeat));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_topic_subscriber_gets_newest_messages_within_backlog() {
+    let addr = start_server(flow(|c| {
+        c.topic_backlog = 10;
+        c.max_in_flight = 64;
+    }))
+    .await;
+    let mut slow = Conn::connect(addr).await;
+    slow.subscribe("0", "/topic/firehose", "auto").await; // not read until the end
+    let mut fast = Conn::connect(addr).await;
+    fast.subscribe("0", "/topic/firehose", "auto").await;
+    let reader = tokio::spawn(async move {
+        let mut n = 0;
+        loop {
+            let m = fast.expect_command(Command::Message).await;
+            n += 1;
+            if body(&m) == "final" {
+                return n;
+            }
+        }
+    });
+
+    let mut p = Conn::connect(addr).await;
+    let big = "x".repeat(64 * 1024);
+    for i in 0..1000 {
+        p.send_with_receipt(send_frame("/topic/firehose", &format!("{i}:{big}")), &i.to_string()).await;
+    }
+    p.publish("/topic/firehose", "final").await;
+
+    // a subscriber that keeps up is unaffected by the stalled one
+    assert_eq!(reader.await.unwrap(), 1001);
+
+    let mut got = Vec::new();
+    while let Some(m) = slow.try_recv(QUIET).await {
+        got.push(body(&m));
+    }
+    assert!(got.len() < 1001, "slow subscriber was buffered without bound");
+    assert_eq!(got.last().map(String::as_str), Some("final"));
+}
+
+// ---------------------------------------------------------------------------
+// Sharding
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn commit_spanning_many_destinations_delivers_everything() {
+    let addr = start_server(flow(|c| c.shards = 8)).await;
+    let mut sub = Conn::connect(addr).await;
+    for d in 0..40 {
+        sub.subscribe(&d.to_string(), &format!("/queue/span-{d}"), "client-individual").await;
+    }
+    let mut c = Conn::connect(addr).await;
+    c.send(begin("t")).await;
+    for d in 0..40 {
+        c.send(send_frame(&format!("/queue/span-{d}"), &d.to_string()).with_header("transaction", "t")).await;
+    }
+    sub.expect_nothing().await;
+    c.send_with_receipt(commit("t"), "c").await;
+    let ms = receive_bodies(&mut sub, 40).await;
+
+    // ack them all in one transaction across shards
+    sub.send(begin("acks")).await;
+    for m in &ms {
+        sub.send(ack(m).with_header("transaction", "acks")).await;
+    }
+    sub.send_with_receipt(commit("acks"), "ca").await;
+    sub.disconnect().await;
+    let mut check = Conn::connect(addr).await;
+    for d in 0..40 {
+        check.subscribe(&d.to_string(), &format!("/queue/span-{d}"), "auto").await;
+    }
+    check.expect_nothing().await;
+}
+
+#[tokio::test]
+async fn ack_id_for_another_shard_or_sequence_is_rejected() {
+    let addr = start_server(flow(|c| c.shards = 4)).await;
+    for bogus in ["4-1", "0-999", "1-", "-1", "x-y"] {
+        let mut c = Conn::connect(addr).await;
+        c.send(Frame::new(Command::Ack).with_header("id", bogus)).await;
+        c.expect_error_and_close().await;
+    }
+}

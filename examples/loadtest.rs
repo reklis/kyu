@@ -4,7 +4,8 @@
 //!   cargo run --release --example loadtest -- queue fanout # pick scenarios
 //!   cargo run --release --example loadtest -- --addr 127.0.0.1:61613
 //!
-//! Scenarios: rtt, queue, parallel, ack, fanout, connections
+//! Scenarios: rtt, queue, parallel, destinations, ack, fanout, idle,
+//!            slowconsumer, connections
 //! Latency is measured from just before SEND to MESSAGE arrival, using a
 //! timestamp header (so producers and consumers must share a process).
 
@@ -14,6 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kyu::client::{AckMode, Client, ConnectOptions, OutgoingMessage};
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use kyu::server::{Server, ServerConfig};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
@@ -156,6 +161,148 @@ async fn parallel(addr: SocketAddr, pairs: usize, per_pair: u64) {
     println!("  {pairs:>3} pairs x {per_pair} msgs   deliver {:>7}/s", human(rate(n, start.elapsed())));
 }
 
+/// D queues with one consumer each; P producers spray messages round-robin
+/// across all of them. Stresses cross-destination contention in the broker.
+async fn destinations(addr: SocketAddr, dests: usize, producers: usize, total: u64) {
+    let prefix = unique("dest");
+    let mut set = JoinSet::new();
+    let per_dest = total / dests as u64;
+    let mut consumers = Vec::new();
+    for d in 0..dests {
+        let c = Client::connect(addr, opts()).await.unwrap();
+        let sub = c.subscribe(&format!("/queue/{prefix}-{d}"), AckMode::Auto).await.unwrap();
+        consumers.push((c, sub));
+    }
+    let start = Instant::now();
+    for (c, mut sub) in consumers {
+        set.spawn(async move {
+            for _ in 0..per_dest {
+                sub.recv().await.unwrap();
+            }
+            c.disconnect().await.ok();
+        });
+    }
+    let per_producer = per_dest * dests as u64 / producers as u64;
+    for p in 0..producers {
+        let prefix = prefix.clone();
+        set.spawn(async move {
+            let c = Client::connect(addr, opts()).await.unwrap();
+            for i in 0..per_producer {
+                let d = (p as u64 * per_producer + i) % dests as u64;
+                c.send(OutgoingMessage::new(format!("/queue/{prefix}-{d}")).body("x".repeat(128))).await.unwrap();
+            }
+            c.disconnect().await.ok();
+        });
+    }
+    set.join_all().await;
+    let n = per_dest * dests as u64;
+    println!(
+        "  {dests:>5} queues  {producers:>3} producers   deliver {:>7}/s",
+        human(rate(n, start.elapsed()))
+    );
+}
+
+/// CPU seconds (user + system) used by this process so far.
+fn cpu_seconds() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let fields: Vec<&str> = stat.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+    let ticks: f64 = fields.get(11).and_then(|u| u.parse::<f64>().ok()).unwrap_or(0.0)
+        + fields.get(12).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    ticks / 100.0
+}
+
+fn rss_mb() -> f64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|kb| kb.parse::<f64>().ok())
+        .map_or(0.0, |kb| kb / 1024.0)
+}
+
+/// N idle connections heart-beating both ways every `ms`: none should be
+/// dropped, and the CPU cost of keeping them alive should be small.
+async fn idle(addr: SocketAddr, clients: usize, ms: u32, hold: Duration) {
+    let mut set = JoinSet::new();
+    for _ in 0..clients {
+        set.spawn(async move { Client::connect(addr, opts().heartbeat(ms, ms)).await.unwrap() });
+    }
+    let cs: Vec<Client> = set.join_all().await;
+    let cpu0 = cpu_seconds();
+    tokio::time::sleep(hold).await;
+    let cpu = cpu_seconds() - cpu0;
+    let mut alive = 0;
+    for c in &cs {
+        if tokio::time::timeout(Duration::from_millis(1), c.closed()).await.is_err() {
+            alive += 1;
+        }
+    }
+    println!(
+        "  {clients:>5} idle clients @ {ms}ms heart-beats for {hold:?}: {alive} alive, {:.1}% of one core",
+        100.0 * cpu / hold.as_secs_f64()
+    );
+    let mut set = JoinSet::new();
+    for c in cs {
+        set.spawn(async move { c.disconnect().await.ok() });
+    }
+    set.join_all().await;
+}
+
+/// A producer at full speed against a consumer limited to `rate_per_sec`:
+/// shows how much the broker buffers when consumers fall behind.
+async fn slow_consumer(addr: SocketAddr, rate_per_sec: u64, run: Duration, ack: AckMode) {
+    let dest = format!("/queue/{}", unique("slow"));
+    let c = Client::connect(addr, opts()).await.unwrap();
+    let mut sub = c.subscribe(&dest, ack).await.unwrap();
+    let rss0 = rss_mb();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sent = Arc::new(AtomicU64::new(0));
+    let producer = {
+        let (stop, sent, dest) = (stop.clone(), sent.clone(), dest.clone());
+        tokio::spawn(async move {
+            let p = Client::connect(addr, opts()).await.unwrap();
+            let body = bytes::Bytes::from(vec![b'x'; 1024]);
+            while !stop.load(Ordering::Relaxed) {
+                p.send(OutgoingMessage::new(&dest).body(body.clone())).await.unwrap();
+                sent.fetch_add(1, Ordering::Relaxed);
+            }
+            p.disconnect().await.ok();
+        })
+    };
+    let start = Instant::now();
+    let mut got = 0u64;
+    let mut peak = rss0;
+    while start.elapsed() < run {
+        if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await {
+            if ack != AckMode::Auto {
+                c.ack(&m).await.unwrap();
+            }
+            got += 1;
+            let behind = start.elapsed().as_secs_f64() * rate_per_sec as f64 - got as f64;
+            if behind < 0.0 {
+                tokio::time::sleep(Duration::from_secs_f64(-behind / rate_per_sec as f64)).await;
+            }
+        }
+        peak = peak.max(rss_mb());
+    }
+    stop.store(true, Ordering::Relaxed);
+    // A throttled producer may be blocked in send(); drop it.
+    producer.abort();
+    let _ = producer.await;
+    let produced = sent.load(Ordering::Relaxed);
+    println!(
+        "  {:<17} produced {:>8}  consumed {:>7}  backlog {:>8}  RSS +{:.0} MB (peak)",
+        format!("{ack:?}"),
+        produced,
+        got,
+        produced.saturating_sub(got),
+        peak - rss0
+    );
+    drop(sub);
+    c.disconnect().await.ok();
+}
+
 /// One producer -> topic with N subscribers (each on its own connection).
 async fn fanout(addr: SocketAddr, subscribers: usize, messages: u64) {
     let dest = format!("/topic/{}", unique("fan"));
@@ -280,7 +427,9 @@ async fn main() {
             a
         }
         None => {
-            let server = Server::bind("127.0.0.1:0", ServerConfig::default()).await.unwrap();
+            // Heart-beats only happen when a client asks for them.
+            let config = ServerConfig { heartbeat: (100, 100), ..ServerConfig::default() };
+            let server = Server::bind("127.0.0.1:0", config).await.unwrap();
             let addr = server.local_addr().unwrap();
             tokio::spawn(server.run());
             addr
@@ -314,6 +463,12 @@ async fn main() {
             parallel(addr, pairs, 200_000).await;
         }
     }
+    if want("destinations") {
+        println!("\n[destinations] many queues, producers spraying across them");
+        for (d, p) in [(10, 8), (100, 16), (1000, 32)] {
+            destinations(addr, d, p, 400_000).await;
+        }
+    }
     if want("ack") {
         println!("\n[ack] queue with explicit acknowledgement");
         queue(addr, 1, 1, 128, 100_000, AckMode::ClientIndividual).await;
@@ -326,10 +481,21 @@ async fn main() {
             fanout(addr, subs, msgs).await;
         }
     }
+    if want("idle") {
+        println!("\n[idle] heart-beat cost of idle connections");
+        for n in [1_000, 4_000] {
+            idle(addr, n, 100, Duration::from_secs(3)).await;
+        }
+    }
     if want("connections") {
         println!("\n[connections] concurrent clients, 10 round trips each");
         for n in [100, 1_000, 5_000, 10_000] {
             connections(addr, n, 10).await;
         }
+    }
+    if want("slowconsumer") {
+        println!("\n[slowconsumer] 1 KiB messages, consumer limited to 2k msg/s for 3s (in-process RSS)");
+        slow_consumer(addr, 2_000, Duration::from_secs(3), AckMode::Auto).await;
+        slow_consumer(addr, 2_000, Duration::from_secs(3), AckMode::ClientIndividual).await;
     }
 }

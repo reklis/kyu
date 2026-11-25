@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,13 +20,12 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpSocket, TcpStream, ToSocketAddrs};
-use tokio::sync::mpsc;
-use tokio::time::{Instant, sleep_until};
+use tokio::sync::{Notify, mpsc};
 use tokio_util::codec::Framed;
 
 use crate::codec::{CodecError, Item, Limits, StompCodec};
 use crate::frame::{Command, Frame};
-use crate::transport::{Activity, negotiate, parse_heartbeat, read_deadline};
+use crate::transport::{Activity, Heartbeats, Tick, negotiate, parse_heartbeat};
 
 pub const SUPPORTED_VERSIONS: &[&str] = &["1.2"];
 const SERVER_NAME: &str = concat!("kyu/", env!("CARGO_PKG_VERSION"));
@@ -41,11 +40,33 @@ pub struct ServerConfig {
     pub limits: Limits,
     /// TCP listen backlog (the kernel caps it at net.core.somaxconn).
     pub backlog: u32,
+    /// Maximum unacknowledged messages per client/client-individual subscription.
+    pub prefetch: usize,
+    /// Maximum MESSAGE frames queued for one connection's socket writer.
+    pub max_in_flight: usize,
+    /// Pending messages a queue may hold before producers are throttled.
+    pub max_queue_depth: usize,
+    /// Per-subscriber buffer for topic messages while the subscriber is busy;
+    /// the oldest messages are dropped beyond this.
+    pub topic_backlog: usize,
+    /// Number of independently locked broker shards (destinations are
+    /// spread across them by hash).
+    pub shards: usize,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        ServerConfig { heartbeat: (0, 0), credentials: None, limits: Limits::default(), backlog: 4096 }
+        ServerConfig {
+            heartbeat: (0, 0),
+            credentials: None,
+            limits: Limits::default(),
+            backlog: 4096,
+            prefetch: 1000,
+            max_in_flight: 1024,
+            max_queue_depth: 100_000,
+            topic_backlog: 10_000,
+            shards: std::thread::available_parallelism().map_or(8, |n| n.get() * 4),
+        }
     }
 }
 
@@ -61,10 +82,11 @@ impl Server {
         for addr in tokio::net::lookup_host(addr).await? {
             match listen(addr, config.backlog) {
                 Ok(listener) => {
+                    let broker = Arc::new(Broker::new(&config));
                     return Ok(Server {
                         listener,
                         config: Arc::new(config),
-                        broker: Arc::new(Broker::default()),
+                        broker,
                     });
                 }
                 Err(e) => last_err = Some(e),
@@ -132,17 +154,25 @@ struct SubState {
     ack: AckMode,
     /// Delivered but not yet acknowledged, keyed by delivery sequence.
     unacked: BTreeMap<u64, StoredMessage>,
+    /// Topic messages waiting for this subscriber to have room (bounded).
+    backlog: VecDeque<StoredMessage>,
 }
 
-struct ConnState {
+/// What a session hands the broker so shards can deliver to it.
+#[derive(Clone)]
+struct ConnHandle {
+    id: ConnId,
     tx: mpsc::UnboundedSender<Frame>,
-    subs: HashMap<String, SubState>,
-    /// ack id -> (subscription id, delivery sequence) for every unacked message.
-    ack_index: HashMap<String, (String, u64)>,
+    /// MESSAGE frames handed to the session but not yet written to the socket.
+    in_flight: Arc<AtomicUsize>,
 }
 
-fn make_ack_id(conn: ConnId, seq: u64) -> String {
-    format!("{conn}-{seq}")
+/// A connection's state within one shard.
+struct ConnShard {
+    handle: ConnHandle,
+    subs: HashMap<String, SubState>,
+    /// delivery sequence -> subscription id for every unacked message.
+    ack_index: HashMap<u64, String>,
 }
 
 #[derive(Default)]
@@ -150,178 +180,337 @@ struct Destination {
     subscribers: Vec<(ConnId, String)>,
     next: usize,
     pending: VecDeque<StoredMessage>,
+    /// Signalled when a full queue drains enough for producers to continue.
+    space: Arc<Notify>,
+    throttling: bool,
 }
 
-#[derive(Default)]
+/// Flow-control limits, copied from the server config.
+#[derive(Clone, Copy)]
+struct FlowLimits {
+    prefetch: usize,
+    max_in_flight: usize,
+    max_queue_depth: usize,
+    topic_backlog: usize,
+}
+
+/// Broker state is split into shards by destination so that unrelated
+/// destinations never contend for the same lock.
 struct Broker {
-    state: Mutex<BrokerState>,
-    ids: AtomicU64,
+    shards: Box<[Mutex<Shard>]>,
+    flow: FlowLimits,
 }
 
 #[derive(Default)]
-struct BrokerState {
-    conns: HashMap<ConnId, ConnState>,
+struct Shard {
+    index: usize,
+    conns: HashMap<ConnId, ConnShard>,
     destinations: HashMap<String, Destination>,
+    seq: u64,
 }
 
 fn is_topic(destination: &str) -> bool {
     destination.starts_with("/topic/")
 }
 
+/// A queue a producer must wait on before sending more.
+struct Throttle {
+    destination: String,
+    space: Arc<Notify>,
+}
+
+enum Op {
+    Send(StoredMessage),
+    /// (shard, delivery sequence) of the message being settled.
+    Ack(usize, u64),
+    Nack(usize, u64),
+}
+
+/// Ack ids are "<shard>-<sequence>", so ACK/NACK go straight to their shard.
+fn parse_ack_id(id: &str, shards: usize) -> Option<(usize, u64)> {
+    let (shard, seq) = id.split_once('-')?;
+    let shard: usize = shard.parse().ok()?;
+    (shard < shards).then_some((shard, seq.parse().ok()?))
+}
+
 impl Broker {
-    fn next_id(&self) -> u64 {
-        self.ids.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn register(&self, conn: ConnId, tx: mpsc::UnboundedSender<Frame>) {
-        self.state.lock().unwrap().conns.insert(conn, ConnState { tx, subs: HashMap::new(), ack_index: HashMap::new() });
-    }
-
-    fn subscribe(&self, conn: ConnId, id: &str, destination: &str, ack: AckMode) -> Result<(), String> {
-        let mut st = self.state.lock().unwrap();
-        let c = st.conns.get_mut(&conn).expect("registered");
-        if c.subs.contains_key(id) {
-            return Err(format!("subscription id '{id}' already in use"));
+    fn new(config: &ServerConfig) -> Broker {
+        let n = config.shards.max(1);
+        Broker {
+            shards: (0..n).map(|index| Mutex::new(Shard { index, ..Shard::default() })).collect(),
+            flow: FlowLimits {
+                prefetch: config.prefetch.max(1),
+                max_in_flight: config.max_in_flight.max(1),
+                max_queue_depth: config.max_queue_depth.max(1),
+                topic_backlog: config.topic_backlog,
+            },
         }
+    }
+
+    fn shard_of(&self, destination: &str) -> usize {
+        use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+        let h = BuildHasherDefault::<DefaultHasher>::default().hash_one(destination);
+        (h % self.shards.len() as u64) as usize
+    }
+
+    fn lock(&self, shard: usize) -> std::sync::MutexGuard<'_, Shard> {
+        self.shards[shard].lock().unwrap()
+    }
+
+    fn subscribe(&self, conn: &ConnHandle, shard: usize, id: &str, destination: &str, ack: AckMode) {
+        self.lock(shard).subscribe(&self.flow, conn, id, destination, ack);
+    }
+
+    fn unsubscribe(&self, conn: ConnId, shard: usize, id: &str) {
+        let mut sh = self.lock(shard);
+        sh.remove_sub(&self.flow, conn, id);
+        if sh.conns.get(&conn).is_some_and(|c| c.subs.is_empty()) {
+            sh.conns.remove(&conn);
+        }
+    }
+
+    fn disconnect(&self, conn: ConnId, shards: impl IntoIterator<Item = usize>) {
+        for shard in shards {
+            let mut sh = self.lock(shard);
+            let ids: Vec<String> = match sh.conns.get(&conn) {
+                Some(c) => c.subs.keys().cloned().collect(),
+                None => continue,
+            };
+            for id in ids {
+                sh.remove_sub(&self.flow, conn, &id);
+            }
+            sh.conns.remove(&conn);
+        }
+    }
+
+    /// Applies a batch of operations atomically, locking every shard involved
+    /// (in index order). Returns a throttle if a queue sent to is now full.
+    fn apply(&self, conn: ConnId, ops: Vec<Op>) -> Option<Throttle> {
+        let shard_of = |op: &Op| match op {
+            Op::Send(m) => self.shard_of(&m.destination),
+            Op::Ack(s, _) | Op::Nack(s, _) => *s,
+        };
+        let mut throttle = None;
+        let mut run = |sh: &mut Shard, op: Op| match op {
+            Op::Send(msg) => {
+                if let Some(t) = sh.publish(&self.flow, msg) {
+                    throttle = Some(t);
+                }
+            }
+            Op::Ack(_, seq) | Op::Nack(_, seq) => sh.settle(&self.flow, conn, seq),
+        };
+        if ops.len() == 1 {
+            let op = ops.into_iter().next().unwrap();
+            let mut sh = self.lock(shard_of(&op));
+            run(&mut sh, op);
+        } else {
+            let mut guards: BTreeMap<usize, std::sync::MutexGuard<'_, Shard>> = BTreeMap::new();
+            let shards: std::collections::BTreeSet<usize> = ops.iter().map(shard_of).collect();
+            for s in shards {
+                guards.insert(s, self.lock(s));
+            }
+            for op in ops {
+                let sh = guards.get_mut(&shard_of(&op)).unwrap();
+                run(sh, op);
+            }
+        }
+        throttle
+    }
+
+    fn has_space(&self, destination: &str) -> bool {
+        let sh = self.lock(self.shard_of(destination));
+        sh.destinations.get(destination).is_none_or(|d| d.pending.len() < self.flow.max_queue_depth)
+    }
+
+    fn is_outstanding(&self, conn: ConnId, shard: usize, seq: u64) -> bool {
+        self.lock(shard).conns.get(&conn).is_some_and(|c| c.ack_index.contains_key(&seq))
+    }
+
+    /// Called when a connection that hit its in-flight limit has room again.
+    fn resume(&self, conn: ConnId, shards: impl IntoIterator<Item = usize>) {
+        for shard in shards {
+            let mut sh = self.lock(shard);
+            let subs: Vec<String> = match sh.conns.get(&conn) {
+                Some(c) => c.subs.keys().cloned().collect(),
+                None => continue,
+            };
+            for sub in subs {
+                sh.refill(&self.flow, conn, &sub);
+            }
+        }
+    }
+}
+
+/// Whether a subscriber can take another message right now.
+fn can_take(flow: &FlowLimits, c: &ConnShard, sub: &SubState) -> bool {
+    c.handle.in_flight.load(Ordering::Relaxed) < flow.max_in_flight
+        && (sub.ack == AckMode::Auto || sub.unacked.len() < flow.prefetch)
+}
+
+impl Shard {
+    fn subscribe(&mut self, flow: &FlowLimits, conn: &ConnHandle, id: &str, destination: &str, ack: AckMode) {
+        let c = self.conns.entry(conn.id).or_insert_with(|| ConnShard {
+            handle: conn.clone(),
+            subs: HashMap::new(),
+            ack_index: HashMap::new(),
+        });
         c.subs.insert(
             id.to_string(),
-            SubState { destination: destination.to_string(), ack, unacked: BTreeMap::new() },
+            SubState {
+                destination: destination.to_string(),
+                ack,
+                unacked: BTreeMap::new(),
+                backlog: VecDeque::new(),
+            },
         );
-        st.destinations
+        self.destinations
             .entry(destination.to_string())
             .or_default()
             .subscribers
-            .push((conn, id.to_string()));
-        self.dispatch(&mut st, destination);
-        Ok(())
+            .push((conn.id, id.to_string()));
+        self.dispatch(flow, destination);
     }
 
-    fn unsubscribe(&self, conn: ConnId, id: &str) -> Result<(), String> {
-        let mut st = self.state.lock().unwrap();
-        if !st.conns[&conn].subs.contains_key(id) {
-            return Err(format!("no subscription with id '{id}'"));
-        }
-        self.remove_sub(&mut st, conn, id);
-        Ok(())
-    }
-
-    fn remove_sub(&self, st: &mut BrokerState, conn: ConnId, id: &str) {
-        let Some(c) = st.conns.get_mut(&conn) else { return };
+    fn remove_sub(&mut self, flow: &FlowLimits, conn: ConnId, id: &str) {
+        let Some(c) = self.conns.get_mut(&conn) else { return };
         let Some(sub) = c.subs.remove(id) else { return };
         for seq in sub.unacked.keys() {
-            c.ack_index.remove(&make_ack_id(conn, *seq));
+            c.ack_index.remove(seq);
         }
-        let dest = st.destinations.get_mut(&sub.destination).expect("destination exists");
+        let dest = self.destinations.get_mut(&sub.destination).expect("destination exists");
         dest.subscribers.retain(|(c, s)| !(*c == conn && s == id));
         if !is_topic(&sub.destination) {
             for (_, msg) in sub.unacked.into_iter().rev() {
                 dest.pending.push_front(msg);
             }
         }
-        self.dispatch(st, &sub.destination);
+        self.dispatch(flow, &sub.destination);
     }
 
-    fn disconnect(&self, conn: ConnId) {
-        let mut st = self.state.lock().unwrap();
-        let ids: Vec<String> = match st.conns.get(&conn) {
-            Some(c) => c.subs.keys().cloned().collect(),
-            None => return,
-        };
-        for id in ids {
-            self.remove_sub(&mut st, conn, &id);
-        }
-        st.conns.remove(&conn);
-    }
-
-    /// Applies a batch of operations atomically.
-    fn apply(&self, conn: ConnId, ops: Vec<Op>) {
-        let mut st = self.state.lock().unwrap();
-        for op in ops {
-            match op {
-                Op::Send(msg) => self.publish(&mut st, msg),
-                Op::Ack(id) => Self::settle(&mut st, conn, &id),
-                Op::Nack(id) => Self::settle(&mut st, conn, &id),
-            }
-        }
-    }
-
-    fn publish(&self, st: &mut BrokerState, msg: StoredMessage) {
+    fn publish(&mut self, flow: &FlowLimits, msg: StoredMessage) -> Option<Throttle> {
         let dest_name = msg.destination.clone();
-        let dest = st.destinations.entry(dest_name.clone()).or_default();
+        let dest = self.destinations.entry(dest_name.clone()).or_default();
         if is_topic(&dest_name) {
             let subs = dest.subscribers.clone();
             for (conn, sub) in subs {
-                Self::deliver(st, conn, &sub, msg.clone(), self.next_id());
+                self.offer_topic(flow, conn, &sub, msg.clone());
             }
+            None
         } else {
             dest.pending.push_back(msg);
-            self.dispatch(st, &dest_name);
-        }
-    }
-
-    /// Hands pending queue messages to subscribers, round robin.
-    fn dispatch(&self, st: &mut BrokerState, dest_name: &str) {
-        loop {
-            let Some(dest) = st.destinations.get_mut(dest_name) else { return };
-            if dest.subscribers.is_empty() || dest.pending.is_empty() {
-                return;
+            self.dispatch(flow, &dest_name);
+            let dest = self.destinations.get_mut(&dest_name).unwrap();
+            if dest.pending.len() >= flow.max_queue_depth {
+                dest.throttling = true;
+                return Some(Throttle { destination: dest_name, space: dest.space.clone() });
             }
+            None
+        }
+    }
+
+    fn offer_topic(&mut self, flow: &FlowLimits, conn: ConnId, sub_id: &str, msg: StoredMessage) {
+        let (index, seq) = (self.index, &mut self.seq);
+        let Some(c) = self.conns.get_mut(&conn) else { return };
+        let Some(sub) = c.subs.get(sub_id) else { return };
+        if sub.backlog.is_empty() && can_take(flow, c, sub) {
+            deliver(index, seq, c, sub_id, msg);
+        } else if flow.topic_backlog > 0 {
+            let sub = c.subs.get_mut(sub_id).unwrap();
+            if sub.backlog.len() >= flow.topic_backlog {
+                sub.backlog.pop_front();
+            }
+            sub.backlog.push_back(msg);
+        }
+    }
+
+    /// Hands pending queue messages to subscribers with room, round robin.
+    fn dispatch(&mut self, flow: &FlowLimits, dest_name: &str) {
+        let Shard { index, conns, destinations, seq } = self;
+        let Some(dest) = destinations.get_mut(dest_name) else { return };
+        while !dest.pending.is_empty() && !dest.subscribers.is_empty() {
+            let n = dest.subscribers.len();
+            let mut chosen = None;
+            for i in 0..n {
+                let idx = (dest.next + i) % n;
+                let (conn, sub_id) = &dest.subscribers[idx];
+                if let Some(c) = conns.get(conn)
+                    && let Some(sub) = c.subs.get(sub_id)
+                    && can_take(flow, c, sub)
+                {
+                    chosen = Some(idx);
+                    break;
+                }
+            }
+            let Some(idx) = chosen else { break };
+            dest.next = idx + 1;
+            let (conn, sub_id) = &dest.subscribers[idx];
             let msg = dest.pending.pop_front().unwrap();
-            dest.next %= dest.subscribers.len();
-            let (conn, sub) = dest.subscribers[dest.next].clone();
-            dest.next += 1;
-            Self::deliver(st, conn, &sub, msg, self.next_id());
+            deliver(*index, seq, conns.get_mut(conn).unwrap(), sub_id, msg);
+        }
+        if dest.throttling && dest.pending.len() < flow.max_queue_depth {
+            dest.throttling = false;
+            dest.space.notify_waiters();
         }
     }
 
-    fn deliver(st: &mut BrokerState, conn: ConnId, sub_id: &str, msg: StoredMessage, ack_seq: u64) {
-        let Some(c) = st.conns.get_mut(&conn) else { return };
-        let Some(sub) = c.subs.get_mut(sub_id) else { return };
-        let mut frame = Frame::new(Command::Message)
-            .with_header("subscription", sub_id)
-            .with_header("message-id", msg.id.clone())
-            .with_header("destination", msg.destination.clone());
-        if sub.ack != AckMode::Auto {
-            let id = make_ack_id(conn, ack_seq);
-            frame = frame.with_header("ack", id.clone());
-            sub.unacked.insert(ack_seq, msg.clone());
-            c.ack_index.insert(id, (sub_id.to_string(), ack_seq));
+    /// Gives a subscriber that gained room as much as it can now take.
+    fn refill(&mut self, flow: &FlowLimits, conn: ConnId, sub_id: &str) {
+        let (index, seq) = (self.index, &mut self.seq);
+        let Some(c) = self.conns.get_mut(&conn) else { return };
+        let Some(sub) = c.subs.get(sub_id) else { return };
+        if is_topic(&sub.destination) {
+            loop {
+                let sub = c.subs.get(sub_id).unwrap();
+                if sub.backlog.is_empty() || !can_take(flow, c, sub) {
+                    break;
+                }
+                let msg = c.subs.get_mut(sub_id).unwrap().backlog.pop_front().unwrap();
+                deliver(index, seq, c, sub_id, msg);
+            }
+        } else {
+            let dest = sub.destination.clone();
+            self.dispatch(flow, &dest);
         }
-        frame.headers.extend(msg.headers);
-        frame.body = msg.body;
-        let _ = c.tx.send(frame);
-    }
-
-    fn is_outstanding(&self, conn: ConnId, ack_id: &str) -> bool {
-        let st = self.state.lock().unwrap();
-        st.conns[&conn].ack_index.contains_key(ack_id)
     }
 
     /// Removes an acknowledged (or NACKed) message, and for `client` mode
-    /// every earlier message on the same subscription.
-    fn settle(st: &mut BrokerState, conn: ConnId, ack_id: &str) {
-        let Some(c) = st.conns.get_mut(&conn) else { return };
-        let Some((sub_id, seq)) = c.ack_index.remove(ack_id) else { return };
+    /// every earlier message on the same subscription; then refills it.
+    fn settle(&mut self, flow: &FlowLimits, conn: ConnId, seq: u64) {
+        let Some(c) = self.conns.get_mut(&conn) else { return };
+        let Some(sub_id) = c.ack_index.remove(&seq) else { return };
         let Some(sub) = c.subs.get_mut(&sub_id) else { return };
         match sub.ack {
             AckMode::Client => {
                 let later = sub.unacked.split_off(&(seq + 1));
                 let settled = std::mem::replace(&mut sub.unacked, later);
                 for earlier in settled.keys() {
-                    c.ack_index.remove(&make_ack_id(conn, *earlier));
+                    c.ack_index.remove(earlier);
                 }
             }
             _ => {
                 sub.unacked.remove(&seq);
             }
         }
+        self.refill(flow, conn, &sub_id);
     }
 }
 
-enum Op {
-    Send(StoredMessage),
-    Ack(String),
-    Nack(String),
+fn deliver(shard: usize, seq: &mut u64, c: &mut ConnShard, sub_id: &str, msg: StoredMessage) {
+    let Some(sub) = c.subs.get_mut(sub_id) else { return };
+    let mut frame = Frame::new(Command::Message)
+        .with_header("subscription", sub_id)
+        .with_header("message-id", msg.id.clone())
+        .with_header("destination", msg.destination.clone());
+    if sub.ack != AckMode::Auto {
+        *seq += 1;
+        frame = frame.with_header("ack", format!("{shard}-{seq}"));
+        sub.unacked.insert(*seq, msg.clone());
+        c.ack_index.insert(*seq, sub_id.to_string());
+    }
+    frame.headers.extend(msg.headers);
+    frame.body = msg.body;
+    c.handle.in_flight.fetch_add(1, Ordering::Relaxed);
+    let _ = c.handle.tx.send(frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,10 +549,18 @@ fn required<'a>(frame: &'a Frame, name: &str) -> Result<&'a str, Fatal> {
 
 type Conn = Framed<Activity<TcpStream>, StompCodec>;
 
+static NEXT_CONN: AtomicU64 = AtomicU64::new(0);
+
 struct Session {
-    id: ConnId,
+    handle: ConnHandle,
     broker: Arc<Broker>,
+    /// subscription id -> shard holding it
+    subs: HashMap<String, usize>,
+    /// per-session counter for message ids
+    messages: u64,
     transactions: HashMap<String, Vec<Op>>,
+    /// Set while a queue this connection sent to is full.
+    throttle: Option<Throttle>,
 }
 
 enum Flow {
@@ -373,9 +570,8 @@ enum Flow {
 
 impl Session {
     async fn run(stream: TcpStream, broker: Arc<Broker>, config: Arc<ServerConfig>) {
-        let last_read = Arc::new(Mutex::new(Instant::now()));
         let mut conn: Conn = Framed::new(
-            Activity { inner: stream, last: last_read.clone() },
+            Activity::new(stream),
             StompCodec::with_limits(config.limits),
         );
 
@@ -393,7 +589,7 @@ impl Session {
             Err(fatal) => return close_with_error(conn, fatal).await,
         };
 
-        let id = broker.next_id();
+        let id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
         let connected = Frame::new(Command::Connected)
             .with_header("version", "1.2")
             .with_header("session", format!("session-{id}"))
@@ -404,28 +600,42 @@ impl Session {
         }
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        broker.register(id, tx);
-        let mut session = Session { id, broker: broker.clone(), transactions: HashMap::new() };
+        let handle = ConnHandle { id, tx, in_flight: Arc::new(AtomicUsize::new(0)) };
+        let mut session = Session {
+            handle,
+            broker: broker.clone(),
+            transactions: HashMap::new(),
+            throttle: None,
+            subs: HashMap::new(),
+            messages: 0,
+        };
 
         // --- frame loop ---
-        let far_future = Duration::from_secs(86400 * 365);
-        let mut last_write = Instant::now();
+        let mut hb = Heartbeats::new(hb_out, hb_in, conn.get_ref().last.clone());
         let outcome: Result<(), Fatal> = loop {
-            let write_due = last_write + hb_out.unwrap_or(far_future);
-            let read_due = *last_read.lock().unwrap() + hb_in.map(read_deadline).unwrap_or(far_future);
             tokio::select! {
-                item = conn.next() => match item {
+                // While a queue we sent to is full, stop reading (TCP pushes back).
+                () = wait_for_space(&broker, session.throttle.as_ref()), if session.throttle.is_some() => {
+                    let t = session.throttle.as_ref().unwrap();
+                    if broker.has_space(&t.destination) {
+                        session.throttle = None;
+                    }
+                }
+                item = conn.next(), if session.throttle.is_none() => match item {
                     Some(Ok(Item::Heartbeat)) => {}
                     Some(Ok(Item::Frame(frame))) => {
                         let receipt = frame.header("receipt").map(str::to_string);
                         match session.handle(frame) {
                             Ok(flow) => {
                                 // Deliveries caused by this or earlier frames go out first.
-                                if flush_queued(&mut conn, &mut rx).await.is_err() { break Ok(()); }
+                                match flush_queued(&mut conn, &mut rx).await {
+                                    Ok(n) => session.written(n),
+                                    Err(_) => break Ok(()),
+                                }
                                 if let Some(r) = receipt {
                                     let rf = Frame::new(Command::Receipt).with_header("receipt-id", r);
                                     if conn.send(rf).await.is_err() { break Ok(()); }
-                                    last_write = Instant::now();
+                                    hb.wrote();
                                 }
                                 if let Flow::Close = flow {
                                     break Ok(());
@@ -444,25 +654,25 @@ impl Session {
                 },
                 Some(frame) = rx.recv() => {
                     if conn.feed(frame).await.is_err() { break Ok(()); }
-                    if flush_queued(&mut conn, &mut rx).await.is_err() { break Ok(()); }
-                    last_write = Instant::now();
-                }
-                _ = sleep_until(write_due), if hb_out.is_some() => {
-                    if conn.send(Item::Heartbeat).await.is_err() { break Ok(()); }
-                    last_write = Instant::now();
-                }
-                _ = sleep_until(read_due), if hb_in.is_some() => {
-                    // Re-check: bytes of a partial frame may have arrived.
-                    if last_read.lock().unwrap().elapsed() >= read_deadline(hb_in.unwrap()) {
-                        break Ok(());
+                    match flush_queued(&mut conn, &mut rx).await {
+                        Ok(n) => session.written(n + 1),
+                        Err(_) => break Ok(()),
                     }
+                    hb.wrote();
                 }
+                tick = hb.tick() => match tick {
+                    Tick::SendHeartbeat => {
+                        if conn.send(Item::Heartbeat).await.is_err() { break Ok(()); }
+                        hb.wrote();
+                    }
+                    Tick::PeerDead => break Ok(()),
+                },
             }
         };
 
         // Any transactions still open are implicitly aborted.
         session.transactions.clear();
-        broker.disconnect(id);
+        broker.disconnect(id, session.shards());
         let _ = flush_queued(&mut conn, &mut rx).await;
         match outcome {
             Err(fatal) => close_with_error(conn, fatal).await,
@@ -486,8 +696,9 @@ impl Session {
                     })
                     .cloned()
                     .collect();
+                self.messages += 1;
                 let msg = StoredMessage {
-                    id: format!("msg-{}", self.broker.next_id()),
+                    id: format!("{}-{}", self.handle.id, self.messages),
                     destination,
                     headers,
                     body: frame.body,
@@ -503,19 +714,30 @@ impl Session {
                     "client-individual" => AckMode::ClientIndividual,
                     other => return Err(Fatal::new(format!("invalid ack mode '{other}'"))),
                 };
-                self.broker.subscribe(self.id, id, destination, ack).map_err(Fatal::new)?;
+                if self.subs.contains_key(id) {
+                    return Err(Fatal::new(format!("subscription id '{id}' already in use")));
+                }
+                let shard = self.broker.shard_of(destination);
+                self.broker.subscribe(&self.handle, shard, id, destination, ack);
+                self.subs.insert(id.to_string(), shard);
             }
             Command::Unsubscribe => {
                 let id = required(&frame, "id")?;
-                self.broker.unsubscribe(self.id, id).map_err(Fatal::new)?;
+                let shard = self
+                    .subs
+                    .remove(id)
+                    .ok_or_else(|| Fatal::new(format!("no subscription with id '{id}'")))?;
+                self.broker.unsubscribe(self.handle.id, shard, id);
             }
             Command::Ack | Command::Nack => {
-                let ack_id = required(&frame, "id")?.to_string();
-                if !self.broker.is_outstanding(self.id, &ack_id) {
+                let ack_id = required(&frame, "id")?;
+                let outstanding = parse_ack_id(ack_id, self.broker.shards.len())
+                    .filter(|&(shard, seq)| self.broker.is_outstanding(self.handle.id, shard, seq));
+                let Some((shard, seq)) = outstanding else {
                     return Err(Fatal::new(format!("no outstanding message with ack id '{ack_id}'")));
-                }
+                };
                 let tx = frame.header("transaction").map(str::to_string);
-                let op = if frame.command == Command::Ack { Op::Ack(ack_id) } else { Op::Nack(ack_id) };
+                let op = if frame.command == Command::Ack { Op::Ack(shard, seq) } else { Op::Nack(shard, seq) };
                 self.submit(tx, op)?;
             }
             Command::Begin => {
@@ -528,7 +750,7 @@ impl Session {
             Command::Commit => {
                 let tx = required(&frame, "transaction")?;
                 let ops = self.take_tx(tx)?;
-                self.broker.apply(self.id, ops);
+                self.throttle = self.broker.apply(self.handle.id, ops).or(self.throttle.take());
             }
             Command::Abort => {
                 let tx = required(&frame, "transaction")?;
@@ -545,7 +767,11 @@ impl Session {
 
     fn submit(&mut self, tx: Option<String>, op: Op) -> Result<(), Fatal> {
         match tx {
-            None => self.broker.apply(self.id, vec![op]),
+            None => {
+                if let Some(t) = self.broker.apply(self.handle.id, vec![op]) {
+                    self.throttle = Some(t);
+                }
+            }
             Some(tx) => self
                 .transactions
                 .get_mut(&tx)
@@ -553,6 +779,22 @@ impl Session {
                 .push(op),
         }
         Ok(())
+    }
+
+    /// Shards this connection has subscriptions in.
+    fn shards(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.subs.values().copied().collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Counts frames written to the socket and tells the broker when a
+    /// connection that was at its in-flight limit has room again.
+    fn written(&self, n: usize) {
+        if n > 0 && self.handle.in_flight.fetch_sub(n, Ordering::Relaxed) >= self.broker.flow.max_in_flight {
+            self.broker.resume(self.handle.id, self.shards());
+        }
     }
 
     fn take_tx(&mut self, tx: &str) -> Result<Vec<Op>, Fatal> {
@@ -591,9 +833,11 @@ fn handshake(f: &Frame, config: &ServerConfig) -> Result<(Option<Duration>, Opti
 }
 
 /// Writes the frames already queued for this connection (plus anything
-/// previously fed) with a single flush per batch.
-async fn flush_queued(conn: &mut Conn, rx: &mut mpsc::UnboundedReceiver<Frame>) -> Result<(), CodecError> {
+/// previously fed) with a single flush per batch. Returns how many it took
+/// from the queue.
+async fn flush_queued(conn: &mut Conn, rx: &mut mpsc::UnboundedReceiver<Frame>) -> Result<usize, CodecError> {
     const BATCH: usize = 256;
+    let mut total = 0;
     loop {
         let mut n = 0;
         while n < BATCH {
@@ -602,10 +846,23 @@ async fn flush_queued(conn: &mut Conn, rx: &mut mpsc::UnboundedReceiver<Frame>) 
             n += 1;
         }
         SinkExt::<Frame>::flush(conn).await?;
+        total += n;
         if n < BATCH {
-            return Ok(());
+            return Ok(total);
         }
     }
+}
+
+/// Waits until a full queue may have room (re-checked by the caller).
+async fn wait_for_space(broker: &Broker, throttle: Option<&Throttle>) {
+    let Some(t) = throttle else { return };
+    let notified = t.space.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if broker.has_space(&t.destination) {
+        return;
+    }
+    let _ = tokio::time::timeout(Duration::from_millis(100), notified).await;
 }
 
 async fn close_with_error(mut conn: Conn, fatal: Fatal) {

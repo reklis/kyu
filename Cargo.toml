@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 bytes = "1.12.2"
 futures = "0.3.34"
+mimalloc = { version = "0.1.52", optional = true }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["codec"] }
@@ -16,3 +17,10 @@ criterion = { version = "0.8.2", features = ["async_tokio"] }
 [[bench]]
 name = "codec"
 harness = false
+
+[profile.profiling]
+inherits = "release"
+debug = true
+
+[features]
+mimalloc = ["dep:mimalloc"]

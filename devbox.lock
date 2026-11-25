@@ -1,0 +1,45 @@
+{
+  "lockfile_version": "1",
+  "packages": {
+    "github:NixOS/nixpkgs/nixpkgs-unstable": {
+      "last_modified": "2026-11-02T01:28:21Z",
+      "resolved": "github:NixOS/nixpkgs/5c9de89ec55bff981cb8da1a4ee92b10f1438ffc?lastModified=1793582901&narHash=sha256-WDValiY9se78X2Wh7aWWaq%2Fc7HN29U555%2BOKbHEzYrw%3D"
+    },
+    "perf@latest": {
+      "last_modified": "2026-10-04T07:06:02Z",
+      "resolved": "github:NixOS/nixpkgs/a322c65bf7233456788a9ebf03bc067db7dc090a#perf",
+      "source": "devbox-search",
+      "version": "7.2.9",
+      "systems": {
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/w507hd7dmd1yna5js1i1yvcxxc3ds2n8-perf-linux-7.2.9",
+              "default": true
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/l3ivcjswycrl4n3b16pnl4c5jmyk8w64-perf-linux-7.2.9-debug"
+            }
+          ],
+          "store_path": "/nix/store/w507hd7dmd1yna5js1i1yvcxxc3ds2n8-perf-linux-7.2.9"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/wvrl2jv46nfig6kmmnsbs899k3cpznyb-perf-linux-7.2.9",
+              "default": true
+            },
+            {
+              "name": "debug",
+              "path": "/nix/store/si2s8s5b2qj9i5kyxf8xixqmgxny5fmq-perf-linux-7.2.9-debug"
+            }
+          ],
+          "store_path": "/nix/store/wvrl2jv46nfig6kmmnsbs899k3cpznyb-perf-linux-7.2.9"
+        }
+      }
+    }
+  }
+}
