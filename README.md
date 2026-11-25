@@ -6,9 +6,8 @@ server (message broker) in Rust, built on tokio.
 - **Spec compliant**: frame format and escaping, `content-length` and binary
   bodies, heart-beating, version negotiation, receipts, transactions and all
   three ack modes. Built test-first; 179 tests.
-- **Fast**: in the comparison below, kyu delivers 1.5–14× the messages per
-  second of the fastest of RabbitMQ, ActiveMQ and Artemis in every scenario
-  but one (1 MiB messages, where RabbitMQ is slightly ahead).
+- **Fast**: in the comparison below, kyu delivers 1.4–6.8× the messages per
+  second of the fastest of RabbitMQ, ActiveMQ and Artemis in every scenario.
 - **Bounded memory**: per-subscription prefetch, per-connection write limits,
   producer throttling when a queue is full, and bounded topic buffers.
 
@@ -107,20 +106,20 @@ bold. "P×C" means producers × consumers on one queue.
 
 | Scenario | kyu | RabbitMQ 4.3.1 | ActiveMQ 6.2.4 | Artemis 2.44.0 |
 |---|---:|---:|---:|---:|
-| Sequential round trips (p50 latency) | **50.7k (14µs)** | 26.7k (35µs) | 14.2k (56µs) | 13.6k (53µs) |
-| Queue 1×1, 128 B | **275k** | 101k | 81k | 128k |
-| Queue 4×4, 128 B | **369k** | 113k | 165k | 126k |
-| Queue 64×64, 128 B | **563k** | 50k | 88k | 114k |
-| Queue 1×1, 16 KiB | **117k** | 65k | 5.7k | 76k |
-| Queue 1×1, 1 MiB | 2.9k | **3.2k** | 93 | 90 |
-| 16 independent queues | **2.31M** | 133k | 145k | 302k |
-| 1,000 queues, 32 producers | **2.82M** | 155k | 129k | 410k |
-| Acknowledged queue 1×1 | **236k** | 39k | 61k | 141k |
-| Acknowledged queue 4×4 | **211k** | 56k | 103k | 117k |
-| Topic, 10 subscribers | **792k** | 205k | 258k | 409k |
-| Topic, 100 subscribers | **2.64M** | 168k | 431k | 843k |
-| Topic, 1,000 subscribers | **2.49M** | 145k | 292k | 1.01M |
-| 10,000 clients: round trips | **353k** | 25.6k | timed out¹ | failed² |
+| Sequential round trips (p50 latency) | **65.2k (13µs)** | 26.7k (35µs) | 14.2k (56µs) | 13.6k (53µs) |
+| Queue 1×1, 128 B | **230k** | 101k | 81k | 128k |
+| Queue 4×4, 128 B | **359k** | 113k | 165k | 126k |
+| Queue 64×64, 128 B | **574k** | 50k | 88k | 114k |
+| Queue 1×1, 16 KiB | **179k** | 65k | 5.7k | 76k |
+| Queue 1×1, 1 MiB | **4.5k** | 3.2k | 93 | 90 |
+| 16 independent queues | **1.98M** | 133k | 145k | 302k |
+| 1,000 queues, 32 producers | **2.47M** | 155k | 129k | 410k |
+| Acknowledged queue 1×1 | **212k** | 39k | 61k | 141k |
+| Acknowledged queue 4×4 | **249k** | 56k | 103k | 117k |
+| Topic, 10 subscribers | **645k** | 205k | 258k | 409k |
+| Topic, 100 subscribers | **2.23M** | 168k | 431k | 843k |
+| Topic, 1,000 subscribers | **2.38M** | 145k | 292k | 1.01M |
+| 10,000 clients: round trips | **173k** | 25.6k | timed out¹ | failed² |
 
 CPU used by 4,000 idle clients heart-beating, measured at each broker's own
 agreed interval (brokers may insist on a slower rate than clients ask for, so
@@ -130,7 +129,7 @@ kyu is measured at the same rate for each comparison):
 |---|---:|---:|
 | 1000 ms | **6.0%** of a core | RabbitMQ 44.7% |
 | 500 ms | **11.7%** | Artemis 31.7% |
-| 100 ms | **66.7%** | ActiveMQ 98.0%, with 1,375 of the 4,000 connections dropped |
+| 100 ms | **67.3%** | ActiveMQ 98.0%, with 1,375 of the 4,000 connections dropped |
 
 ¹ ActiveMQ did not finish the 5,000-client step within 5 minutes.
 ² Artemis closed connections ("did not receive data within the 60000ms
