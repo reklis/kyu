@@ -1,6 +1,54 @@
 {
   "lockfile_version": "1",
   "packages": {
+    "actionlint@latest": {
+      "last_modified": "2026-10-02T22:55:44Z",
+      "resolved": "github:NixOS/nixpkgs/55ba7f49ef2962b42cbd126522b7df5f95037679#actionlint",
+      "source": "devbox-search",
+      "version": "1.7.12",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/r3shp5s12nk21gslkp2k7drq4n2bs1m9-actionlint-1.7.12",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/r3shp5s12nk21gslkp2k7drq4n2bs1m9-actionlint-1.7.12"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/zcs2y541jbqr94xslvrniz5ilnppdprd-actionlint-1.7.12",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/zcs2y541jbqr94xslvrniz5ilnppdprd-actionlint-1.7.12"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/w4rjv0ikr5r5x54w758c8ck2016nmzsx-actionlint-1.7.12",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/w4rjv0ikr5r5x54w758c8ck2016nmzsx-actionlint-1.7.12"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/bwxcfsghzk4hyynxgl3lvjgmcnkc7qhf-actionlint-1.7.12",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/bwxcfsghzk4hyynxgl3lvjgmcnkc7qhf-actionlint-1.7.12"
+        }
+      }
+    },
     "activemq@latest": {
       "last_modified": "2026-10-02T22:55:44Z",
       "resolved": "github:NixOS/nixpkgs/55ba7f49ef2962b42cbd126522b7df5f95037679#activemq",

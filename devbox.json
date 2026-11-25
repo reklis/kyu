@@ -4,7 +4,8 @@
     "perf@latest",
     "rabbitmq-server@latest",
     "activemq@latest",
-    "rust-code-analysis@latest"
+    "rust-code-analysis@latest",
+    "actionlint@latest"
   ],
   "shell": {
     "init_hook": [
@@ -25,7 +26,8 @@
       ],
       "lint": [
         "cargo clippy --all-targets -- -D warnings -W clippy::pedantic",
-        "cargo clippy --all-targets --no-default-features -- -D warnings -W clippy::pedantic"
+        "cargo clippy --all-targets --no-default-features -- -D warnings -W clippy::pedantic",
+        "actionlint"
       ],
       "complexity": [
         "rust-code-analysis-cli -m -O json -p src > target/metrics.jsonl",
@@ -35,6 +37,7 @@
         "cargo fmt --check",
         "cargo clippy --all-targets -- -D warnings -W clippy::pedantic",
         "cargo clippy --all-targets --no-default-features -- -D warnings -W clippy::pedantic",
+        "actionlint",
         "rust-code-analysis-cli -m -O json -p src > target/metrics.jsonl",
         "python3 scripts/complexity.py target/metrics.jsonl",
         "cargo test"

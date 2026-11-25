@@ -1,0 +1,76 @@
+# Builds the kyu image on every push and publishes it to GitHub Container
+# Registry as ghcr.io/<owner>/<repo>.
+#
+# Tags: the branch name, sha-<short commit>, `latest` on the default branch,
+# and the version for v* git tags (v1.2.3 -> 1.2.3 and 1.2).
+name: docker
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Build into the local Docker first: nothing is published unless the
+      # image starts and passes its own health check (a real STOMP CONNECT).
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: kyu:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          docker run -d --name kyu kyu:ci
+          for _ in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' kyu)
+            [ "$status" = healthy ] && break
+            sleep 1
+          done
+          docker logs kyu
+          [ "$status" = healthy ] || { echo "image did not become healthy ($status)"; exit 1; }
+          docker stop kyu
+
+      # Same build, from cache, pushed with its tags.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

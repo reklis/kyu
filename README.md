@@ -20,8 +20,15 @@ kyu deploys as a single container: the `kyu-server` binary on a
 [distroless](https://github.com/GoogleContainerTools/distroless) base image
 (no shell or package manager, runs as a non-root user), about 45 MB.
 
+Every push builds the image, checks that it starts and passes its health
+check, and publishes it to GitHub Container Registry
+(`.github/workflows/docker.yml`): tagged with the branch name,
+`sha-<commit>`, `latest` for the default branch, and the version for `v*`
+tags.
+
 ```sh
-docker build -t kyu .
+docker pull ghcr.io/reklis/kyu:latest
+docker build -t kyu .            # or build it yourself
 docker run -d --name kyu -p 61613:61613 kyu
 docker run -d --name kyu -p 61613:61613 -e KYU_LOGIN=app -e KYU_PASSCODE=secret kyu
 ```
@@ -160,7 +167,7 @@ devbox run loadtest -- fanout  # one scenario
 ## Development
 
 ```sh
-devbox run check   # rustfmt, clippy (pedantic, with and without mimalloc), complexity gate, tests
+devbox run check   # rustfmt, clippy (pedantic, with and without mimalloc), actionlint, complexity gate, tests
 devbox run bench   # codec micro-benchmarks (criterion)
 ```
 
@@ -171,3 +178,12 @@ complexity 20 or cognitive complexity 15, measured with
 The server and load test use [mimalloc](https://github.com/microsoft/mimalloc)
 by default (the `mimalloc` feature); the library itself never sets a global
 allocator.
+
+## License
+
+Copyright (C) 2026 the kyu contributors.
+
+kyu is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See [LICENSE](LICENSE) for the full text.
