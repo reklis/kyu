@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::Framed;
 
 use crate::codec::{CodecError, Item, StompCodec};
-use crate::frame::{Command, Frame};
+use crate::frame::{Command, Frame, Str};
 use crate::transport::{Activity, Heartbeats, Tick, negotiate, parse_heartbeat};
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -147,17 +147,17 @@ pub struct OutgoingMessage {
 }
 
 impl OutgoingMessage {
-    pub fn new(destination: impl Into<String>) -> Self {
+    pub fn new(destination: impl Into<Str>) -> Self {
         OutgoingMessage { frame: Frame::new(Command::Send).with_header("destination", destination) }
     }
 
     /// Adds a user-defined header.
-    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn header(mut self, name: impl Into<Str>, value: impl Into<Str>) -> Self {
         self.frame = self.frame.with_header(name, value);
         self
     }
 
-    pub fn content_type(self, ct: impl Into<String>) -> Self {
+    pub fn content_type(self, ct: impl Into<Str>) -> Self {
         self.header("content-type", ct)
     }
 

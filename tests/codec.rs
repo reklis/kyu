@@ -3,7 +3,7 @@
 
 use bytes::{Bytes, BytesMut};
 use kyu::codec::{CodecError, Item, Limits, StompCodec};
-use kyu::frame::{Command, Frame};
+use kyu::frame::{Command, Frame, Str};
 use tokio_util::codec::{Decoder, Encoder};
 
 fn decode_all(input: &[u8]) -> Result<Vec<Item>, CodecError> {
@@ -353,7 +353,7 @@ fn first_repeated_header_wins_and_history_is_kept() {
     assert_eq!(f.header("foo"), Some("World"));
     assert_eq!(
         f.headers,
-        vec![("foo".to_string(), "World".to_string()), ("foo".to_string(), "Hello".to_string())]
+        vec![("foo".into(), "World".into()), ("foo".into(), "Hello".into())] as Vec<(Str, Str)>
     );
 }
 

@@ -24,7 +24,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::codec::{Encoder, Framed};
 
 use crate::codec::{CodecError, Item, Limits, StompCodec, escape_into};
-use crate::frame::{Command, Frame};
+use crate::frame::{Command, Frame, Str};
 use crate::transport::{Activity, Heartbeats, Tick, negotiate, parse_heartbeat};
 
 /// Hash maps keyed by client-chosen strings (destinations, subscription
@@ -149,7 +149,7 @@ enum AckMode {
 /// per-subscription `subscription` and `ack` headers is encoded once, at
 /// SEND time, and shared by every delivery.
 struct StoredMessage {
-    destination: String,
+    destination: Str,
     /// Encoded `message-id`, `destination`, user headers, `content-length`
     /// and the blank line that ends the headers.
     head: Bytes,
@@ -161,13 +161,13 @@ type Msg = Arc<StoredMessage>;
 impl StoredMessage {
     /// Encodes a SEND frame's headers for delivery. Server headers come
     /// first, so a producer cannot override them (the first value wins).
-    fn from_send(id: (ConnId, u64), destination: &str, frame: Frame) -> StoredMessage {
+    fn from_send(id: (ConnId, u64), destination: Str, frame: Frame) -> StoredMessage {
         use std::fmt::Write;
         let user = |k: &str| !matches!(k, "destination" | "transaction" | "receipt" | "content-length");
         let len: usize = frame.headers.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
         let mut head = BytesMut::with_capacity(len + destination.len() + 64);
         let _ = write!(head, "message-id:{}-{}\ndestination:", id.0, id.1);
-        escape_into(destination, &mut head);
+        escape_into(&destination, &mut head);
         head.put_u8(b'\n');
         for (k, v) in frame.headers.iter().filter(|(k, _)| user(k)) {
             escape_into(k, &mut head);
@@ -179,7 +179,7 @@ impl StoredMessage {
             let _ = writeln!(head, "content-length:{}", frame.body.len());
         }
         head.put_u8(b'\n');
-        StoredMessage { destination: destination.to_string(), head: head.freeze(), body: frame.body }
+        StoredMessage { destination, head: head.freeze(), body: frame.body }
     }
 }
 
@@ -492,7 +492,7 @@ impl Shard {
     fn publish(&mut self, flow: &FlowLimits, msg: Msg) -> Option<Throttle> {
         if is_topic(&msg.destination) {
             let Shard { index, conns, destinations, seq } = self;
-            if let Some(dest) = destinations.get(&msg.destination) {
+            if let Some(dest) = destinations.get(msg.destination.as_str()) {
                 for (conn, sub_id) in &dest.subscribers {
                     if let Some(c) = conns.get_mut(conn) {
                         offer_topic(flow, *index, seq, c, sub_id, &msg);
@@ -626,7 +626,7 @@ fn deliver(shard: usize, seq: &mut u64, c: &mut ConnShard, sub_id: &str, msg: Ms
 struct Fatal {
     message: String,
     detail: Option<String>,
-    extra: Vec<(String, String)>,
+    extra: Vec<(Str, Str)>,
 }
 
 impl Fatal {
@@ -638,7 +638,7 @@ impl Fatal {
         self
     }
     fn header(mut self, k: &str, v: &str) -> Fatal {
-        self.extra.push((k.to_string(), v.to_string()));
+        self.extra.push((k.into(), v.into()));
         self
     }
 }
@@ -817,7 +817,7 @@ impl Session {
                     Err(mut fatal) => {
                         self.flush_batch();
                         if let Some(r) = receipt {
-                            fatal.extra.push(("receipt-id".into(), r));
+                            fatal.extra.push((Str::from_static("receipt-id"), r.into()));
                         }
                         return Some(Err(fatal));
                     }
@@ -874,10 +874,11 @@ impl Session {
         }
         match frame.command {
             Command::Send => {
-                let destination = required(&frame, "destination")?.to_string();
+                required(&frame, "destination")?;
+                let destination = frame.header_value("destination").unwrap().clone();
                 let tx = frame.header("transaction").map(str::to_string);
                 self.messages += 1;
-                let msg = StoredMessage::from_send((self.handle.id, self.messages), &destination, frame);
+                let msg = StoredMessage::from_send((self.handle.id, self.messages), destination, frame);
                 self.submit(tx, Op::Send(Arc::new(msg)))?;
             }
             Command::Subscribe => {

@@ -358,6 +358,7 @@ dependencies = [
  "criterion",
  "foldhash",
  "futures",
+ "memchr",
  "mimalloc",
  "thiserror",
  "tokio",
