@@ -90,6 +90,12 @@ client.disconnect().await?;
 
 The client works with any STOMP 1.2 broker.
 
+### Other languages
+
+kyu works with standard STOMP 1.2 clients. [`examples/`](examples/) has
+Node.js, Python and Ruby examples using each language's usual STOMP library;
+`devbox run examples` runs all three against a fresh server.
+
 ## Performance
 
 The same load generator (`examples/loadtest.rs`, using kyu's client) drives
@@ -167,8 +173,9 @@ devbox run loadtest -- fanout  # one scenario
 ## Development
 
 ```sh
-devbox run check   # rustfmt, clippy (pedantic, with and without mimalloc), actionlint, complexity gate, tests
-devbox run bench   # codec micro-benchmarks (criterion)
+devbox run check      # rustfmt, clippy (pedantic, with and without mimalloc), actionlint, complexity gate, tests
+devbox run bench      # codec micro-benchmarks (criterion)
+devbox run examples   # Node.js, Python and Ruby clients against a fresh server
 ```
 
 `scripts/complexity.py` fails the check if any function exceeds cyclomatic

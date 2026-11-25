@@ -1,0 +1,17 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    stomp (1.4.10)
+
+PLATFORMS
+  ruby
+  x86_64-linux
+
+DEPENDENCIES
+  stomp (~> 1.4)
+
+CHECKSUMS
+  stomp (1.4.10) sha256=4ee5cb30341627a1d5d928e02353dd69e8c00e8a6301815762e253ce3a9e84af
+
+BUNDLED WITH
+  4.0.20

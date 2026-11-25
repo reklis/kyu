@@ -5,7 +5,10 @@
     "rabbitmq-server@latest",
     "activemq@latest",
     "rust-code-analysis@latest",
-    "actionlint@latest"
+    "actionlint@latest",
+    "nodejs@latest",
+    "ruby@latest",
+    "python@latest"
   ],
   "shell": {
     "init_hook": [
@@ -41,6 +44,9 @@
         "rust-code-analysis-cli -m -O json -p src > target/metrics.jsonl",
         "python3 scripts/complexity.py target/metrics.jsonl",
         "cargo test"
+      ],
+      "examples": [
+        "scripts/examples.sh $@"
       ]
     }
   }

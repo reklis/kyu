@@ -1,2 +1,7 @@
 /target
 /.brokers
+# Example clients: installed dependencies and local tool state
+/examples/node/node_modules
+/examples/python/.venv
+/examples/ruby/vendor
+/examples/ruby/.bundle
