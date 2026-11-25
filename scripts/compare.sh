@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Runs the load test against each STOMP broker listening locally, one at a
-# time, and stores the output under .brokers/results/<broker>.txt.
+# Runs the load test against each STOMP broker in turn. Each broker is started
+# with fresh data just before its run and stopped afterwards, so only one runs
+# at a time and none carries state from another test. Output goes to
+# .brokers/results/<broker>.txt.
 #
+#   scripts/brokers.sh setup                      # once
 #   scripts/compare.sh [broker...] [-- scenario...]
 #
-# Brokers (start them first, see .brokers/): kyu:61613 rabbitmq:61614
-# activemq:61615 artemis:61617
+# Set NO_RESTART=1 to test brokers that are already running instead.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -25,6 +27,10 @@ mkdir -p .brokers/results
 
 for b in "${brokers[@]}"; do
     port=${PORT[$b]}
+    if [ -z "${NO_RESTART:-}" ]; then
+        scripts/brokers.sh stop "$b"
+        scripts/brokers.sh start "$b" > /dev/null || { echo "skip $b: failed to start"; continue; }
+    fi
     pid=$(ss -ltnpH "sport = :$port" | grep -oP 'pid=\K[0-9]+' | head -1)
     [ -z "$pid" ] && { echo "skip $b: nothing listening on $port"; continue; }
     out=.brokers/results/$b.txt
@@ -41,4 +47,5 @@ for b in "${brokers[@]}"; do
             echo "  [$s] FAILED (exit $rc)" | tee -a "$out"
         fi
     done
+    [ -z "${NO_RESTART:-}" ] && scripts/brokers.sh stop "$b"
 done
