@@ -4,6 +4,18 @@ All notable changes to kyu are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/); before 1.0, minor versions may
 change the public API.
 
+## 0.1.1 (2026-11-25)
+
+### Added
+
+- Client examples in Node.js (`@stomp/stompjs` with `@stomp/tcp-wrapper`),
+  Python (`stomp.py`) and Ruby (`stomp` gem), each sending, receiving and
+  acknowledging a message against kyu. `devbox run examples` runs all three
+  against a fresh server. `examples/README.md` notes the setting each library
+  needs for STOMP 1.2 over TCP.
+
+No changes to the library, server or Docker image behaviour.
+
 ## 0.1.0 (2026-11-25)
 
 First release: a STOMP 1.2 client and server (message broker) on tokio.
