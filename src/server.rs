@@ -9,7 +9,7 @@
 //!   ends (UNSUBSCRIBE, DISCONNECT or connection failure);
 //! * NACKed messages are discarded.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, ToSocketAddrs};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::codec::Framed;
@@ -32,7 +32,6 @@ pub const SUPPORTED_VERSIONS: &[&str] = &["1.2"];
 const SERVER_NAME: &str = concat!("kyu/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone)]
-#[derive(Default)]
 pub struct ServerConfig {
     /// (sx, sy): the smallest interval (ms) at which the server can send
     /// heart-beats, and the interval at which it wants to receive them.
@@ -40,8 +39,15 @@ pub struct ServerConfig {
     /// Required (login, passcode), if any.
     pub credentials: Option<(String, String)>,
     pub limits: Limits,
+    /// TCP listen backlog (the kernel caps it at net.core.somaxconn).
+    pub backlog: u32,
 }
 
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig { heartbeat: (0, 0), credentials: None, limits: Limits::default(), backlog: 4096 }
+    }
+}
 
 pub struct Server {
     listener: TcpListener,
@@ -51,11 +57,20 @@ pub struct Server {
 
 impl Server {
     pub async fn bind(addr: impl ToSocketAddrs, config: ServerConfig) -> io::Result<Server> {
-        Ok(Server {
-            listener: TcpListener::bind(addr).await?,
-            config: Arc::new(config),
-            broker: Arc::new(Broker::default()),
-        })
+        let mut last_err = None;
+        for addr in tokio::net::lookup_host(addr).await? {
+            match listen(addr, config.backlog) {
+                Ok(listener) => {
+                    return Ok(Server {
+                        listener,
+                        config: Arc::new(config),
+                        broker: Arc::new(Broker::default()),
+                    });
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addresses to bind")))
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -65,7 +80,14 @@ impl Server {
     /// Accepts connections forever.
     pub async fn run(self) {
         loop {
-            let Ok((stream, _)) = self.listener.accept().await else { continue };
+            let stream = match self.listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    // e.g. out of file descriptors: back off instead of spinning
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+            };
             let _ = stream.set_nodelay(true);
             let broker = self.broker.clone();
             let config = self.config.clone();
@@ -74,6 +96,13 @@ impl Server {
             });
         }
     }
+}
+
+fn listen(addr: SocketAddr, backlog: u32) -> io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(backlog)
 }
 
 // ---------------------------------------------------------------------------
@@ -101,13 +130,19 @@ struct StoredMessage {
 struct SubState {
     destination: String,
     ack: AckMode,
-    /// Delivered but not yet acknowledged, in delivery order.
-    unacked: Vec<(String, StoredMessage)>,
+    /// Delivered but not yet acknowledged, keyed by delivery sequence.
+    unacked: BTreeMap<u64, StoredMessage>,
 }
 
 struct ConnState {
     tx: mpsc::UnboundedSender<Frame>,
     subs: HashMap<String, SubState>,
+    /// ack id -> (subscription id, delivery sequence) for every unacked message.
+    ack_index: HashMap<String, (String, u64)>,
+}
+
+fn make_ack_id(conn: ConnId, seq: u64) -> String {
+    format!("{conn}-{seq}")
 }
 
 #[derive(Default)]
@@ -139,7 +174,7 @@ impl Broker {
     }
 
     fn register(&self, conn: ConnId, tx: mpsc::UnboundedSender<Frame>) {
-        self.state.lock().unwrap().conns.insert(conn, ConnState { tx, subs: HashMap::new() });
+        self.state.lock().unwrap().conns.insert(conn, ConnState { tx, subs: HashMap::new(), ack_index: HashMap::new() });
     }
 
     fn subscribe(&self, conn: ConnId, id: &str, destination: &str, ack: AckMode) -> Result<(), String> {
@@ -150,7 +185,7 @@ impl Broker {
         }
         c.subs.insert(
             id.to_string(),
-            SubState { destination: destination.to_string(), ack, unacked: Vec::new() },
+            SubState { destination: destination.to_string(), ack, unacked: BTreeMap::new() },
         );
         st.destinations
             .entry(destination.to_string())
@@ -171,7 +206,11 @@ impl Broker {
     }
 
     fn remove_sub(&self, st: &mut BrokerState, conn: ConnId, id: &str) {
-        let Some(sub) = st.conns.get_mut(&conn).and_then(|c| c.subs.remove(id)) else { return };
+        let Some(c) = st.conns.get_mut(&conn) else { return };
+        let Some(sub) = c.subs.remove(id) else { return };
+        for seq in sub.unacked.keys() {
+            c.ack_index.remove(&make_ack_id(conn, *seq));
+        }
         let dest = st.destinations.get_mut(&sub.destination).expect("destination exists");
         dest.subscribers.retain(|(c, s)| !(*c == conn && s == id));
         if !is_topic(&sub.destination) {
@@ -243,9 +282,10 @@ impl Broker {
             .with_header("message-id", msg.id.clone())
             .with_header("destination", msg.destination.clone());
         if sub.ack != AckMode::Auto {
-            let ack_id = format!("{conn}-{ack_seq}");
-            frame = frame.with_header("ack", ack_id.clone());
-            sub.unacked.push((ack_id, msg.clone()));
+            let id = make_ack_id(conn, ack_seq);
+            frame = frame.with_header("ack", id.clone());
+            sub.unacked.insert(ack_seq, msg.clone());
+            c.ack_index.insert(id, (sub_id.to_string(), ack_seq));
         }
         frame.headers.extend(msg.headers);
         frame.body = msg.body;
@@ -254,20 +294,25 @@ impl Broker {
 
     fn is_outstanding(&self, conn: ConnId, ack_id: &str) -> bool {
         let st = self.state.lock().unwrap();
-        st.conns[&conn].subs.values().any(|s| s.unacked.iter().any(|(a, _)| a == ack_id))
+        st.conns[&conn].ack_index.contains_key(ack_id)
     }
 
     /// Removes an acknowledged (or NACKed) message, and for `client` mode
     /// every earlier message on the same subscription.
     fn settle(st: &mut BrokerState, conn: ConnId, ack_id: &str) {
         let Some(c) = st.conns.get_mut(&conn) else { return };
-        for sub in c.subs.values_mut() {
-            if let Some(i) = sub.unacked.iter().position(|(a, _)| a == ack_id) {
-                match sub.ack {
-                    AckMode::Client => drop(sub.unacked.drain(..=i)),
-                    _ => drop(sub.unacked.remove(i)),
+        let Some((sub_id, seq)) = c.ack_index.remove(ack_id) else { return };
+        let Some(sub) = c.subs.get_mut(&sub_id) else { return };
+        match sub.ack {
+            AckMode::Client => {
+                let later = sub.unacked.split_off(&(seq + 1));
+                let settled = std::mem::replace(&mut sub.unacked, later);
+                for earlier in settled.keys() {
+                    c.ack_index.remove(&make_ack_id(conn, *earlier));
                 }
-                return;
+            }
+            _ => {
+                sub.unacked.remove(&seq);
             }
         }
     }
@@ -398,7 +443,8 @@ impl Session {
                     None => break Ok(()),
                 },
                 Some(frame) = rx.recv() => {
-                    if conn.send(frame).await.is_err() { break Ok(()); }
+                    if conn.feed(frame).await.is_err() { break Ok(()); }
+                    if flush_queued(&mut conn, &mut rx).await.is_err() { break Ok(()); }
                     last_write = Instant::now();
                 }
                 _ = sleep_until(write_due), if hb_out.is_some() => {
@@ -544,17 +590,22 @@ fn handshake(f: &Frame, config: &ServerConfig) -> Result<(Option<Duration>, Opti
     Ok((negotiate(sx, cy), negotiate(cx, sy)))
 }
 
-/// Writes every frame already queued for this connection.
+/// Writes the frames already queued for this connection (plus anything
+/// previously fed) with a single flush per batch.
 async fn flush_queued(conn: &mut Conn, rx: &mut mpsc::UnboundedReceiver<Frame>) -> Result<(), CodecError> {
-    let mut any = false;
-    while let Ok(frame) = rx.try_recv() {
-        conn.feed(frame).await?;
-        any = true;
-    }
-    if any {
+    const BATCH: usize = 256;
+    loop {
+        let mut n = 0;
+        while n < BATCH {
+            let Ok(frame) = rx.try_recv() else { break };
+            conn.feed(frame).await?;
+            n += 1;
+        }
         SinkExt::<Frame>::flush(conn).await?;
+        if n < BATCH {
+            return Ok(());
+        }
     }
-    Ok(())
 }
 
 async fn close_with_error(mut conn: Conn, fatal: Fatal) {

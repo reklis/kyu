@@ -494,24 +494,59 @@ impl IoTask {
                     Some(Err(e)) => return e.into(),
                     None => return Error::ConnectionClosed,
                 },
-                cmd = self.out.recv() => match cmd {
-                    Some(Outgoing::Frame(frame, done)) => {
-                        // Clients MUST NOT send any more frames after DISCONNECT.
-                        if disconnecting {
-                            let _ = done.send(Err(Error::ConnectionClosed));
-                            continue;
+                cmd = self.out.recv() => {
+                    // Write everything already queued, then flush once.
+                    let mut next = cmd;
+                    let mut waiters = Vec::new();
+                    let mut close = false;
+                    let mut failed = None;
+                    loop {
+                        match next {
+                            Some(Outgoing::Frame(frame, done)) => {
+                                // Clients MUST NOT send any more frames after DISCONNECT.
+                                if disconnecting || failed.is_some() {
+                                    let _ = done.send(Err(Error::ConnectionClosed));
+                                } else {
+                                    disconnecting = frame.command == Command::Disconnect;
+                                    match self.conn.feed(frame).await {
+                                        Ok(()) => waiters.push(done),
+                                        Err(e) => {
+                                            let e = Error::from(e);
+                                            let _ = done.send(Err(e.clone()));
+                                            failed = Some(e);
+                                        }
+                                    }
+                                }
+                            }
+                            Some(Outgoing::Close) | None => {
+                                close = true;
+                                break;
+                            }
                         }
-                        disconnecting = frame.command == Command::Disconnect;
-                        let res = self.conn.send(frame).await.map_err(Error::from);
-                        let failed = res.as_ref().err().cloned();
-                        let _ = done.send(res);
-                        if let Some(e) = failed {
-                            return e;
+                        if waiters.len() >= 256 {
+                            break;
                         }
-                        last_write = Instant::now();
+                        match self.out.try_recv() {
+                            Ok(cmd) => next = Some(cmd),
+                            Err(_) => break,
+                        }
                     }
-                    Some(Outgoing::Close) | None => return Error::ConnectionClosed,
-                },
+                    if failed.is_none()
+                        && let Err(e) = SinkExt::<Frame>::flush(&mut self.conn).await {
+                            failed = Some(e.into());
+                        }
+                    let res = failed.clone().map_or(Ok(()), Err);
+                    for done in waiters {
+                        let _ = done.send(res.clone());
+                    }
+                    if let Some(e) = failed {
+                        return e;
+                    }
+                    if close {
+                        return Error::ConnectionClosed;
+                    }
+                    last_write = Instant::now();
+                }
                 _ = sleep_until(write_due), if self.hb_out.is_some() => {
                     if let Err(e) = self.conn.send(Item::Heartbeat).await {
                         return e.into();

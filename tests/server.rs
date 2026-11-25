@@ -1012,3 +1012,22 @@ async fn messages_queued_for_a_client_are_flushed_before_its_receipt_and_close()
     assert_eq!(r.header("receipt-id"), Some("77"));
     c.expect_closed().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accepts_a_burst_of_concurrent_connections() {
+    // STOMP servers must support clients which rapidly connect and disconnect.
+    let addr = start_default_server().await;
+    let start = std::time::Instant::now();
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..3000 {
+        set.spawn(async move {
+            let mut c = Conn::open(addr).await;
+            c.send(connect_frame()).await;
+            c.expect_command(Command::Connected).await;
+            c
+        });
+    }
+    let conns = set.join_all().await;
+    assert_eq!(conns.len(), 3000);
+    assert!(start.elapsed() < Duration::from_millis(900), "burst took {:?}", start.elapsed());
+}
