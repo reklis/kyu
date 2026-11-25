@@ -1,0 +1,552 @@
+//! A STOMP 1.2 client.
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), kyu::client::Error> {
+//! use kyu::client::{AckMode, Client, ConnectOptions, OutgoingMessage};
+//!
+//! let client = Client::connect("127.0.0.1:61613", ConnectOptions::new("localhost")).await?;
+//! let mut sub = client.subscribe("/queue/a", AckMode::ClientIndividual).await?;
+//! client.send_confirmed(OutgoingMessage::new("/queue/a").content_type("text/plain").body("hi")).await?;
+//! if let Some(msg) = sub.recv().await {
+//!     client.ack(&msg).await?;
+//! }
+//! client.disconnect().await?;
+//! # Ok(()) }
+//! ```
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::{Instant, sleep_until};
+use tokio_util::codec::Framed;
+
+use crate::codec::{CodecError, Item, StompCodec};
+use crate::frame::{Command, Frame};
+use crate::transport::{Activity, negotiate, parse_heartbeat, read_deadline};
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum Error {
+    #[error("i/o error: {0}")]
+    Io(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
+    #[error("server error: {message:?}")]
+    Server { message: Option<String>, frame: Frame },
+    #[error("server negotiated unsupported version {0}")]
+    UnsupportedVersion(String),
+    #[error("connection closed")]
+    ConnectionClosed,
+    #[error("server stopped heart-beating")]
+    HeartbeatTimeout,
+    #[error("message has no ack header")]
+    NoAckHeader,
+}
+
+impl From<CodecError> for Error {
+    fn from(e: CodecError) -> Error {
+        match e {
+            CodecError::Io(e) => Error::Io(e.to_string()),
+            other => Error::Protocol(other.to_string()),
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Error {
+        Error::Io(e.to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectOptions {
+    host: String,
+    login: Option<String>,
+    passcode: Option<String>,
+    heartbeat: (u32, u32),
+    use_stomp_command: bool,
+}
+
+impl ConnectOptions {
+    /// `host` is the virtual host to connect to (the CONNECT `host` header).
+    pub fn new(host: impl Into<String>) -> ConnectOptions {
+        ConnectOptions {
+            host: host.into(),
+            login: None,
+            passcode: None,
+            heartbeat: (0, 0),
+            use_stomp_command: false,
+        }
+    }
+
+    pub fn credentials(mut self, login: impl Into<String>, passcode: impl Into<String>) -> Self {
+        self.login = Some(login.into());
+        self.passcode = Some(passcode.into());
+        self
+    }
+
+    /// (cx, cy): the interval (ms) at which this client can send heart-beats,
+    /// and the interval at which it wants to receive them. 0 disables.
+    pub fn heartbeat(mut self, cx: u32, cy: u32) -> Self {
+        self.heartbeat = (cx, cy);
+        self
+    }
+
+    /// Send STOMP instead of CONNECT (only 1.2 servers understand it).
+    pub fn use_stomp_command(mut self, yes: bool) -> Self {
+        self.use_stomp_command = yes;
+        self
+    }
+}
+
+/// Details from the server's CONNECTED frame.
+#[derive(Debug, Clone)]
+pub struct Connected {
+    pub version: String,
+    pub session: Option<String>,
+    pub server: Option<String>,
+    /// The server's (sx, sy) heart-beat settings.
+    pub heartbeat: (u32, u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckMode {
+    Auto,
+    Client,
+    ClientIndividual,
+}
+
+impl AckMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AckMode::Auto => "auto",
+            AckMode::Client => "client",
+            AckMode::ClientIndividual => "client-individual",
+        }
+    }
+}
+
+/// A message to SEND.
+#[derive(Debug, Clone)]
+pub struct OutgoingMessage {
+    frame: Frame,
+}
+
+impl OutgoingMessage {
+    pub fn new(destination: impl Into<String>) -> Self {
+        OutgoingMessage { frame: Frame::new(Command::Send).with_header("destination", destination) }
+    }
+
+    /// Adds a user-defined header.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.frame = self.frame.with_header(name, value);
+        self
+    }
+
+    pub fn content_type(self, ct: impl Into<String>) -> Self {
+        self.header("content-type", ct)
+    }
+
+    pub fn body(mut self, body: impl Into<Bytes>) -> Self {
+        self.frame.body = body.into();
+        self
+    }
+}
+
+/// A MESSAGE received on a subscription.
+#[derive(Debug, Clone)]
+pub struct Message {
+    frame: Frame,
+}
+
+impl Message {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.frame.header(name)
+    }
+    pub fn body(&self) -> &Bytes {
+        &self.frame.body
+    }
+    pub fn destination(&self) -> Option<&str> {
+        self.header("destination")
+    }
+    pub fn message_id(&self) -> Option<&str> {
+        self.header("message-id")
+    }
+    pub fn subscription(&self) -> Option<&str> {
+        self.header("subscription")
+    }
+    /// The `ack` header, present for client and client-individual subscriptions.
+    pub fn ack_id(&self) -> Option<&str> {
+        self.header("ack")
+    }
+    pub fn frame(&self) -> &Frame {
+        &self.frame
+    }
+}
+
+pub struct Subscription {
+    id: String,
+    rx: mpsc::UnboundedReceiver<Message>,
+}
+
+impl Subscription {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The next message, or None once the connection has closed.
+    pub async fn recv(&mut self) -> Option<Message> {
+        self.rx.recv().await
+    }
+}
+
+#[derive(Default)]
+struct Shared {
+    receipts: HashMap<String, oneshot::Sender<Result<(), Error>>>,
+    subs: HashMap<String, mpsc::UnboundedSender<Message>>,
+    closed: Option<Error>,
+}
+
+enum Outgoing {
+    Frame(Frame, oneshot::Sender<Result<(), Error>>),
+    Close,
+}
+
+pub struct Client {
+    out: mpsc::UnboundedSender<Outgoing>,
+    shared: Arc<Mutex<Shared>>,
+    closed: watch::Receiver<Option<Error>>,
+    connected: Connected,
+    ids: AtomicU64,
+}
+
+type Conn = Framed<Activity<TcpStream>, StompCodec>;
+
+impl Client {
+    pub async fn connect(addr: impl ToSocketAddrs, options: ConnectOptions) -> Result<Client, Error> {
+        let stream = TcpStream::connect(addr).await?;
+        let _ = stream.set_nodelay(true);
+        let mut conn: Conn = Framed::new(Activity::new(stream), StompCodec::new());
+
+        let command = if options.use_stomp_command { Command::Stomp } else { Command::Connect };
+        let mut connect = Frame::new(command)
+            .with_header("accept-version", "1.2")
+            .with_header("host", options.host.clone());
+        if let Some(login) = &options.login {
+            connect = connect.with_header("login", login.clone());
+        }
+        if let Some(passcode) = &options.passcode {
+            connect = connect.with_header("passcode", passcode.clone());
+        }
+        let (cx, cy) = options.heartbeat;
+        if (cx, cy) != (0, 0) {
+            connect = connect.with_header("heart-beat", format!("{cx},{cy}"));
+        }
+        conn.send(connect).await?;
+
+        let reply = loop {
+            match conn.next().await {
+                Some(Ok(Item::Heartbeat)) => continue,
+                Some(Ok(Item::Frame(f))) => break f,
+                Some(Err(e)) => return Err(e.into()),
+                None => return Err(Error::ConnectionClosed),
+            }
+        };
+        match reply.command {
+            Command::Connected => {}
+            Command::Error => return Err(server_error(reply)),
+            other => return Err(Error::Protocol(format!("expected CONNECTED, got {}", other.as_str()))),
+        }
+        // A CONNECTED frame without a version header comes from a 1.0 server.
+        let version = reply.header("version").unwrap_or("1.0").to_string();
+        if version != "1.2" {
+            return Err(Error::UnsupportedVersion(version));
+        }
+        let (sx, sy) = parse_heartbeat(reply.header("heart-beat"))
+            .ok_or_else(|| Error::Protocol("invalid heart-beat header".into()))?;
+        let connected = Connected {
+            version,
+            session: reply.header("session").map(str::to_string),
+            server: reply.header("server").map(str::to_string),
+            heartbeat: (sx, sy),
+        };
+
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (closed_tx, closed_rx) = watch::channel(None);
+        let io = IoTask {
+            conn,
+            shared: shared.clone(),
+            out: out_rx,
+            hb_out: negotiate(cx, sy),
+            hb_in: negotiate(sx, cy),
+        };
+        tokio::spawn(io.run(closed_tx));
+
+        Ok(Client { out: out_tx, shared, closed: closed_rx, connected, ids: AtomicU64::new(0) })
+    }
+
+    pub fn connected(&self) -> &Connected {
+        &self.connected
+    }
+
+    fn next_id(&self, prefix: &str) -> String {
+        format!("{prefix}-{}", self.ids.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Writes a raw frame to the server.
+    pub async fn send_frame(&self, frame: Frame) -> Result<(), Error> {
+        if let Some(e) = self.shared.lock().unwrap().closed.clone() {
+            return Err(e);
+        }
+        let (tx, rx) = oneshot::channel();
+        if self.out.send(Outgoing::Frame(frame, tx)).is_err() {
+            return Err(self.closed().await);
+        }
+        rx.await.unwrap_or(Err(Error::ConnectionClosed))
+    }
+
+    /// Writes a frame with a fresh receipt header and waits for the RECEIPT.
+    async fn send_with_receipt(&self, frame: Frame) -> Result<(), Error> {
+        let receipt = self.next_id("rcpt");
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut shared = self.shared.lock().unwrap();
+            if let Some(e) = shared.closed.clone() {
+                return Err(e);
+            }
+            shared.receipts.insert(receipt.clone(), tx);
+        }
+        self.send_frame(frame.with_header("receipt", receipt)).await?;
+        rx.await.unwrap_or(Err(Error::ConnectionClosed))
+    }
+
+    pub async fn send(&self, msg: OutgoingMessage) -> Result<(), Error> {
+        self.send_frame(msg.frame).await
+    }
+
+    /// Sends and waits for the server's RECEIPT.
+    pub async fn send_confirmed(&self, msg: OutgoingMessage) -> Result<(), Error> {
+        self.send_with_receipt(msg.frame).await
+    }
+
+    /// Subscribes and waits until the server confirms the subscription.
+    pub async fn subscribe(&self, destination: &str, ack: AckMode) -> Result<Subscription, Error> {
+        let id = self.next_id("sub");
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.shared.lock().unwrap().subs.insert(id.clone(), tx);
+        let frame = Frame::new(Command::Subscribe)
+            .with_header("id", id.clone())
+            .with_header("destination", destination)
+            .with_header("ack", ack.as_str());
+        if let Err(e) = self.send_with_receipt(frame).await {
+            self.shared.lock().unwrap().subs.remove(&id);
+            return Err(e);
+        }
+        Ok(Subscription { id, rx })
+    }
+
+    pub async fn unsubscribe(&self, sub: Subscription) -> Result<(), Error> {
+        let res = self
+            .send_with_receipt(Frame::new(Command::Unsubscribe).with_header("id", sub.id.clone()))
+            .await;
+        self.shared.lock().unwrap().subs.remove(&sub.id);
+        res
+    }
+
+    fn ack_frame(command: Command, msg: &Message, tx: Option<&str>) -> Result<Frame, Error> {
+        let id = msg.ack_id().ok_or(Error::NoAckHeader)?;
+        let mut f = Frame::new(command).with_header("id", id);
+        if let Some(tx) = tx {
+            f = f.with_header("transaction", tx);
+        }
+        Ok(f)
+    }
+
+    pub async fn ack(&self, msg: &Message) -> Result<(), Error> {
+        self.send_frame(Self::ack_frame(Command::Ack, msg, None)?).await
+    }
+
+    pub async fn nack(&self, msg: &Message) -> Result<(), Error> {
+        self.send_frame(Self::ack_frame(Command::Nack, msg, None)?).await
+    }
+
+    pub async fn begin(&self) -> Result<Transaction<'_>, Error> {
+        let id = self.next_id("tx");
+        self.send_frame(Frame::new(Command::Begin).with_header("transaction", id.clone())).await?;
+        Ok(Transaction { client: self, id })
+    }
+
+    /// Gracefully disconnects: sends DISCONNECT with a receipt, waits for the
+    /// RECEIPT (all previous frames have then been received), and closes.
+    pub async fn disconnect(self) -> Result<(), Error> {
+        let res = self.send_with_receipt(Frame::new(Command::Disconnect)).await;
+        let _ = self.out.send(Outgoing::Close);
+        let _ = self.closed().await;
+        res
+    }
+
+    /// Resolves when the connection ends, with the reason.
+    pub async fn closed(&self) -> Error {
+        let mut rx = self.closed.clone();
+        match rx.wait_for(|c| c.is_some()).await {
+            Ok(v) => v.clone().unwrap(),
+            Err(_) => Error::ConnectionClosed,
+        }
+    }
+}
+
+/// A transaction; frames sent through it are bound to it. Dropping it without
+/// committing leaves it open until the connection ends, when the server aborts it.
+pub struct Transaction<'a> {
+    client: &'a Client,
+    id: String,
+}
+
+impl Transaction<'_> {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub async fn send(&self, msg: OutgoingMessage) -> Result<(), Error> {
+        self.client.send_frame(msg.frame.with_header("transaction", self.id.clone())).await
+    }
+
+    pub async fn ack(&self, msg: &Message) -> Result<(), Error> {
+        self.client.send_frame(Client::ack_frame(Command::Ack, msg, Some(&self.id))?).await
+    }
+
+    pub async fn nack(&self, msg: &Message) -> Result<(), Error> {
+        self.client.send_frame(Client::ack_frame(Command::Nack, msg, Some(&self.id))?).await
+    }
+
+    pub async fn commit(self) -> Result<(), Error> {
+        self.client
+            .send_with_receipt(Frame::new(Command::Commit).with_header("transaction", self.id))
+            .await
+    }
+
+    pub async fn abort(self) -> Result<(), Error> {
+        self.client
+            .send_with_receipt(Frame::new(Command::Abort).with_header("transaction", self.id))
+            .await
+    }
+}
+
+fn server_error(frame: Frame) -> Error {
+    Error::Server { message: frame.header("message").map(str::to_string), frame }
+}
+
+/// Owns the socket: writes outgoing frames, routes incoming ones, and keeps
+/// heart-beats flowing in both directions.
+struct IoTask {
+    conn: Conn,
+    shared: Arc<Mutex<Shared>>,
+    out: mpsc::UnboundedReceiver<Outgoing>,
+    hb_out: Option<Duration>,
+    hb_in: Option<Duration>,
+}
+
+impl IoTask {
+    async fn run(mut self, closed_tx: watch::Sender<Option<Error>>) {
+        let reason = self.event_loop().await;
+        {
+            let mut shared = self.shared.lock().unwrap();
+            shared.closed = Some(reason.clone());
+            for (_, waiter) in shared.receipts.drain() {
+                let _ = waiter.send(Err(reason.clone()));
+            }
+            shared.subs.clear();
+        }
+        // Fail anything still queued for writing.
+        self.out.close();
+        while let Ok(cmd) = self.out.try_recv() {
+            if let Outgoing::Frame(_, done) = cmd {
+                let _ = done.send(Err(reason.clone()));
+            }
+        }
+        let _ = closed_tx.send(Some(reason));
+        let _ = self.conn.get_mut().inner.shutdown().await;
+    }
+
+    async fn event_loop(&mut self) -> Error {
+        let far = Duration::from_secs(86400 * 365);
+        let last_read = self.conn.get_ref().last.clone();
+        let mut last_write = Instant::now();
+        let mut disconnecting = false;
+        loop {
+            let write_due = last_write + self.hb_out.unwrap_or(far);
+            let read_due = *last_read.lock().unwrap() + self.hb_in.map(read_deadline).unwrap_or(far);
+            tokio::select! {
+                item = self.conn.next() => match item {
+                    Some(Ok(Item::Heartbeat)) => {}
+                    Some(Ok(Item::Frame(f))) => {
+                        if let Some(reason) = self.incoming(f) {
+                            return reason;
+                        }
+                    }
+                    Some(Err(e)) => return e.into(),
+                    None => return Error::ConnectionClosed,
+                },
+                cmd = self.out.recv() => match cmd {
+                    Some(Outgoing::Frame(frame, done)) => {
+                        // Clients MUST NOT send any more frames after DISCONNECT.
+                        if disconnecting {
+                            let _ = done.send(Err(Error::ConnectionClosed));
+                            continue;
+                        }
+                        disconnecting = frame.command == Command::Disconnect;
+                        let res = self.conn.send(frame).await.map_err(Error::from);
+                        let failed = res.as_ref().err().cloned();
+                        let _ = done.send(res);
+                        if let Some(e) = failed {
+                            return e;
+                        }
+                        last_write = Instant::now();
+                    }
+                    Some(Outgoing::Close) | None => return Error::ConnectionClosed,
+                },
+                _ = sleep_until(write_due), if self.hb_out.is_some() => {
+                    if let Err(e) = self.conn.send(Item::Heartbeat).await {
+                        return e.into();
+                    }
+                    last_write = Instant::now();
+                }
+                _ = sleep_until(read_due), if self.hb_in.is_some() => {
+                    if last_read.lock().unwrap().elapsed() >= read_deadline(self.hb_in.unwrap()) {
+                        return Error::HeartbeatTimeout;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handles a server frame; returns Some(reason) if the connection must end.
+    fn incoming(&mut self, f: Frame) -> Option<Error> {
+        match f.command {
+            Command::Message => {
+                let shared = self.shared.lock().unwrap();
+                if let Some(tx) = f.header("subscription").and_then(|s| shared.subs.get(s)) {
+                    let _ = tx.send(Message { frame: f });
+                }
+                None
+            }
+            Command::Receipt => {
+                if let Some(id) = f.header("receipt-id")
+                    && let Some(waiter) = self.shared.lock().unwrap().receipts.remove(id) {
+                        let _ = waiter.send(Ok(()));
+                    }
+                None
+            }
+            // The server closes the connection after an ERROR.
+            Command::Error => Some(server_error(f)),
+            other => Some(Error::Protocol(format!("unexpected {} frame from server", other.as_str()))),
+        }
+    }
+}
